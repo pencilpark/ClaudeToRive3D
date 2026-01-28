@@ -56,7 +56,7 @@ def convert_cube_example():
     
     # Print sample Rive code
     print("\n" + "="*60)
-    print("SAMPLE RIVE RUNTIME CODE:")
+    print("SAMPLE RIVE RUNTIME CODE (JavaScript/TypeScript):")
     print("="*60)
     print(f"""
 // Vertex data (x, y, z positions)
@@ -65,13 +65,16 @@ const vertices = [{', '.join(map(str, vertex_array[:30]))}...];
 // Index data (triangle indices)
 const indices = [{', '.join(map(str, index_array[:30]))}...];
 
-// Create mesh in Rive
-const mesh = new RiveMesh({{
+// Create mesh in Rive runtime
+// NOTE: Replace with actual Rive API - this is a placeholder example
+const mesh = rive.createMesh({{
     vertices: vertices,
     indices: indices,
     vertexCount: {len(optimized_verts)},
     triangleCount: {len(optimized_faces)}
 }});
+
+// Consult Rive documentation for the correct API methods
 """)
     
     return {

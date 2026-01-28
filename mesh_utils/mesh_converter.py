@@ -9,7 +9,14 @@ import json
 def blender_to_rive_coordinates(vertices):
     """
     Convert Blender coordinate system to Rive coordinate system
-    Blender uses Z-up, right-handed. Adjust based on Rive's requirements.
+    Blender uses Z-up, right-handed coordinate system.
+    
+    IMPORTANT: This performs a basic Z-up to Y-up conversion. You MUST verify
+    this matches Rive's actual coordinate system requirements and adjust accordingly.
+    Common conversions:
+    - Z-up to Y-up: x'=x, y'=z, z'=-y (current implementation)
+    - Identity: x'=x, y'=y, z'=z (no conversion needed)
+    - Other custom transforms as needed
     
     Args:
         vertices (list): List of vertex dictionaries with x, y, z coordinates
@@ -19,7 +26,7 @@ def blender_to_rive_coordinates(vertices):
     """
     converted = []
     for v in vertices:
-        # Example conversion - adjust based on actual Rive requirements
+        # Z-up to Y-up conversion - VERIFY this matches Rive's requirements
         converted.append({
             'x': v['x'],
             'y': v['z'],  # Swap Y and Z for Z-up to Y-up
@@ -64,6 +71,10 @@ def optimize_mesh(vertices, faces, tolerance=0.0001):
     """
     Remove duplicate vertices and update face indices
     
+    NOTE: This uses a naive O(n²) algorithm. For large meshes (>1000 vertices),
+    this may be slow. Consider implementing spatial hashing for better performance
+    with large meshes.
+    
     Args:
         vertices (list): List of vertices
         faces (list): List of faces
@@ -72,7 +83,7 @@ def optimize_mesh(vertices, faces, tolerance=0.0001):
     Returns:
         tuple: (optimized_vertices, optimized_faces)
     """
-    # Simple implementation - can be enhanced with spatial hashing
+    # Simple implementation - can be enhanced with spatial hashing for large meshes
     unique_vertices = []
     vertex_map = {}
     
@@ -114,9 +125,22 @@ def load_mesh_json(filepath):
         
     Returns:
         dict: Mesh data
+        
+    Raises:
+        FileNotFoundError: If the file doesn't exist
+        json.JSONDecodeError: If the file is not valid JSON
     """
-    with open(filepath, 'r') as f:
-        return json.load(f)
+    try:
+        with open(filepath, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Mesh file not found: {filepath}")
+    except json.JSONDecodeError as e:
+        raise json.JSONDecodeError(
+            f"Invalid JSON in mesh file {filepath}: {e.msg}",
+            e.doc,
+            e.pos
+        )
 
 
 def save_mesh_json(mesh_data, filepath):
@@ -126,6 +150,15 @@ def save_mesh_json(mesh_data, filepath):
     Args:
         mesh_data (dict): Mesh data
         filepath (str): Output file path
+        
+    Raises:
+        PermissionError: If the file cannot be written
+        IOError: If there's an error writing the file
     """
-    with open(filepath, 'w') as f:
-        json.dump(mesh_data, f, indent=2)
+    try:
+        with open(filepath, 'w') as f:
+            json.dump(mesh_data, f, indent=2)
+    except PermissionError:
+        raise PermissionError(f"Permission denied writing to: {filepath}")
+    except IOError as e:
+        raise IOError(f"Error writing mesh file {filepath}: {e}")

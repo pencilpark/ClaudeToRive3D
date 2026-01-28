@@ -1,9 +1,19 @@
 """
 Blender Mesh Export Utility
 Export mesh data from Blender in a format ready for Rive import
+
+NOTE: This script must be run inside Blender's Python environment.
+It will not work as a standalone Python script because it requires the 'bpy' module.
 """
 
-import bpy
+try:
+    import bpy
+except ImportError:
+    raise ImportError(
+        "This script requires the 'bpy' module which is only available in Blender's Python environment. "
+        "Please run this script from within Blender (Text Editor or Python Console)."
+    )
+
 import json
 
 
@@ -34,13 +44,14 @@ def get_active_mesh_data():
     # Extract faces (convert to triangles if needed)
     faces = []
     for f in mesh.polygons:
-        if len(f.vertices) == 3:
+        num_verts = len(f.vertices)
+        if num_verts == 3:
             # Already a triangle
             faces.append({
                 'indices': list(f.vertices),
                 'normal': list(f.normal)
             })
-        elif len(f.vertices) == 4:
+        elif num_verts == 4:
             # Convert quad to two triangles
             v = list(f.vertices)
             faces.append({
@@ -51,6 +62,14 @@ def get_active_mesh_data():
                 'indices': [v[0], v[2], v[3]],
                 'normal': list(f.normal)
             })
+        else:
+            # N-gon: use fan triangulation
+            v = list(f.vertices)
+            for i in range(1, num_verts - 1):
+                faces.append({
+                    'indices': [v[0], v[i], v[i + 1]],
+                    'normal': list(f.normal)
+                })
     
     return {
         'vertices': vertices,
@@ -77,4 +96,7 @@ def export_to_json(filepath):
 
 if __name__ == "__main__":
     # Example usage
-    export_to_json("/tmp/mesh_export.json")
+    import os
+    import tempfile
+    output_path = os.path.join(tempfile.gettempdir(), "mesh_export.json")
+    export_to_json(output_path)

@@ -97,7 +97,7 @@ Import simple 3D geometry for use in Rive projects
 - Static decorations
 
 ### Textured Meshes
-Import meshes with UV coordinates for texture mapping
+Import meshes with UV coordinates for texture mapping:
 - Textured 3D objects
 - Image-mapped surfaces
 
