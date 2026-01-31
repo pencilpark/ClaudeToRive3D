@@ -298,6 +298,136 @@ end
 | Model offset | Wrong anchor point | Adjust `baseAnchorX/Y/Z` values |
 | **"Code too complex to typecheck"** | **Shared vertices across all parts** | **Extract only used vertices per part + remap indices** |
 
+---
+
+## RGBA Transparency Support
+
+Colors in Property Group now support alpha channel for transparency:
+
+```luau
+-- In Property Group factory
+clothingColor = Color.rgba(97, 73, 119, 255),   -- Opaque
+ghostColor = Color.rgba(200, 200, 255, 128),    -- 50% transparent
+invisibleColor = Color.rgba(0, 0, 0, 0),        -- Fully transparent
+```
+
+The alpha value flows through `Mesh3DUtil.mapColorWithTint()` and is preserved in the final rendered color.
+
+---
+
+## Skeletal Animation System
+
+### Required Files
+```
+Model.luau              -- Main Node Script
+ModelPartXData.luau     -- Util: vertices, faces, skeleton, skinning, animations
+Mesh3DUtil.luau         -- Util: 3D math + matrix/quaternion functions
+SkeletalAnimUtil.luau   -- Util: skeleton building, animation sampling, skinning
+```
+
+### Data Structure for Animated Models
+
+```luau
+-- In your Data file (e.g., CloudPartAData.luau)
+
+ModelData.skeleton = {
+  jointCount = 5,
+  jointParents = { nil, 1, 2, 2, 1 },  -- nil for root joints
+  inverseBindMatrices = {
+    { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 },  -- Mat4 per joint
+    -- ...
+  },
+  restPose = {
+    { translation = {0,0,0}, rotation = {0,0,0,1}, scale = {1,1,1} },
+    -- ...
+  },
+}
+
+ModelData.skinning = {
+  joints = { 0,0,0,0, 1,2,0,0, ... },   -- 4 joint indices per vertex
+  weights = { 1,0,0,0, 0.5,0.5,0,0, ... }, -- 4 weights per vertex (sum to 1)
+}
+
+ModelData.animations = {
+  ["idle"] = {
+    name = "idle",
+    duration = 2.0,
+    channels = {
+      {
+        jointIndex = 1,
+        path = "translation",  -- or "rotation" or "scale"
+        times = { 0, 1, 2 },
+        values = { 0,0,0, 0,0.1,0, 0,0,0 },  -- 3 floats per keyframe (vec3)
+      },
+      {
+        jointIndex = 2,
+        path = "rotation",
+        times = { 0, 0.5, 1 },
+        values = { 0,0,0,1, 0,0,0.38,0.92, 0,0,0,1 },  -- 4 floats per keyframe (quat)
+      },
+    },
+  },
+  ["walk"] = { ... },
+}
+```
+
+### Animation Property Group Inputs
+
+```luau
+export type Model3D = {
+  -- Animation controls
+  animationEnabled: Input<boolean>,  -- Toggle animation on/off
+  animationName: Input<string>,      -- Name of clip to play ("idle", "walk", etc.)
+  animationSpeed: Input<number>,     -- Playback speed multiplier (1.0 = normal)
+  -- ...
+}
+```
+
+### Animation Functions (SkeletalAnimUtil)
+
+```luau
+local SkelAnim = require('SkeletalAnimUtil')
+
+-- Build skeleton from data
+local skeleton = SkelAnim.buildSkeleton(data.skeleton)
+
+-- Sample animation at current time
+SkelAnim.sampleAnimation(skeleton, animationClip, time)
+
+-- Update world/skin matrices
+SkelAnim.updateSkeleton(skeleton)
+
+-- Skin vertices
+local skinnedVerts = SkelAnim.skinVertices(skeleton, originalVertices, skinningData)
+
+-- Blend between two animations
+SkelAnim.blendAnimations(skeleton, clipA, clipB, timeA, timeB, blendFactor)
+
+-- Reset to rest pose
+SkelAnim.resetToRestPose(skeleton, data.skeleton.restPose)
+```
+
+### Blender Export Workflow for Animations
+
+1. **Rig your model** with an Armature
+2. **Paint vertex weights** for each bone
+3. **Create animations** (Actions) in the Action Editor
+4. **Export** using Python script to extract:
+   - Skeleton hierarchy (parent indices)
+   - Inverse bind matrices (from `bone.matrix_local.inverted()`)
+   - Rest pose TRS (from `bone.matrix_local.decompose()`)
+   - Skinning data (vertex groups → joints/weights)
+   - Animation keyframes (fcurves → times/values per channel)
+
+### Animation Pitfalls
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Model explodes | Wrong inverse bind matrices | Check matrix export order (column-major) |
+| Animation wrong speed | Duration mismatch | Verify duration matches last keyframe time |
+| Jerky motion | Missing keyframes | Ensure smooth interpolation in Blender |
+| Wrong rotation | Quaternion sign flip | Use `quatSlerp` for proper interpolation |
+| Joints don't affect mesh | Missing skinning data | Check vertex weights sum to 1.0 |
+
 ### Mesh3DUtil Functions (Reference)
 ```luau
 M.toRadians(degrees)                    -- Convert to radians
