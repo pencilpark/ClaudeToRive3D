@@ -51,48 +51,60 @@ Convert the provided Blender 3D model into functional Rive Node Script Luau code
 
 **Skeleton Data Extraction (via Blender MCP)**
 
-Use `mcp__blender__execute_blender_code` to extract skeleton hierarchy:
+⚠️ **CRITICAL: Armature Scale Problem**
+
+If the Armature has a non-identity scale, bone matrices may cause animations to be amplified/exploded. **ALWAYS CHECK scale in bone transforms.** 
+
+Use `mcp__blender__execute_blender_code` to extract skeleton hierarchy with CORRECTED scale:
 
 ```python
 import bpy
 import json
+from mathutils import Matrix, Vector, Quaternion
 
 armature = bpy.data.objects['Armature']  # Adjust name as needed
 bones = armature.data.bones
 
+# Get armature world matrix for proper normalization
+armature_world = armature.matrix_world
+
 skeleton_data = {
     "jointCount": len(bones),
     "jointParents": [],
-    "inverseBindMatrices": [],
+    "BindMatrices": [],
     "restPose": []
 }
 
-bone_to_index = {bone.name: i+1 for i, bone in enumerate(bones)}
 
 for bone in bones:
     # Parent index (nil/None for root bones)
     parent_idx = bone_to_index.get(bone.parent.name) if bone.parent else None
     skeleton_data["jointParents"].append(parent_idx)
 
-    # Inverse Bind Matrix (column-major, 16 floats)
-    ibm = bone.matrix_local.inverted()
-    skeleton_data["inverseBindMatrices"].append([
-        ibm[0][0], ibm[1][0], ibm[2][0], ibm[3][0],
-        ibm[0][1], ibm[1][1], ibm[2][1], ibm[3][1],
-        ibm[0][2], ibm[1][2], ibm[2][2], ibm[3][2],
-        ibm[0][3], ibm[1][3], ibm[2][3], ibm[3][3],
-    ])
+    # Get bone matrix in world space (includes armature transform)
+    bone_world = armature_world @ bone.matrix_local
 
-    # Rest Pose TRS
-    loc, rot, scale = bone.matrix_local.decompose()
-    skeleton_data["restPose"].append({
-        "translation": [loc.x, loc.y, loc.z],
-        "rotation": [rot.x, rot.y, rot.z, rot.w],
-        "scale": [scale.x, scale.y, scale.z]
+   ->Decompose to get position and rotation
+
+   ->CRITICAL: Prevent animation amplification
+
+   ->CONSTRUCT matrix properly
+
+   ->Calculate IBM from normalized matrix
+   
+
+    ->skeleton_data["restPose"].append({
+        "translation": [],
+        "rotation": [], 
+        "scale": **FIND THE BEST WORKAROUND**
     })
 
 print(json.dumps(skeleton_data, indent=2))
 ```
+
+**Why This Matters:**
+- Animation keyframes become amplified by this factor
+- Result: Model "explodes" or stretches wildly during animation
 
 **Skinning Data Extraction**
 
@@ -133,9 +145,11 @@ print(json.dumps(skinning_data))
 
 **Animation Data Extraction**
 
+
 ```python
 import bpy
 import json
+from collections import defaultdict
 
 armature = bpy.data.objects['Armature']
 bones = armature.data.bones
@@ -145,14 +159,20 @@ bone_to_index = {bone.name: i+1 for i, bone in enumerate(bones)}
 animations = {}
 
 for action in bpy.data.actions:
+    fps = bpy.context.scene.render.fps
+    frame_start, frame_end = action.frame_range
+    duration = (frame_end - frame_start) / fps
+
     clip = {
         "name": action.name,
-        "duration": (action.frame_range[1] - action.frame_range[0]) / bpy.context.scene.render.fps,
+        "duration": duration,
         "channels": []
     }
 
+    # Group fcurves by bone and property
+    bone_channels = defaultdict(lambda: defaultdict(dict))
+
     for fcurve in action.fcurves:
-        # Parse data_path like 'pose.bones["BoneName"].location'
         if 'pose.bones' not in fcurve.data_path:
             continue
 
@@ -160,37 +180,55 @@ for action in bpy.data.actions:
         if bone_name not in bone_to_index:
             continue
 
-        joint_idx = bone_to_index[bone_name]
-
-        # Determine path type
+        # Determine property type
         if 'location' in fcurve.data_path:
-            path = 'translation'
-            components = 3
+            prop = 'translation'
         elif 'rotation_quaternion' in fcurve.data_path:
-            path = 'rotation'
-            components = 4
+            prop = 'rotation'
         elif 'scale' in fcurve.data_path:
-            path = 'scale'
-            components = 3
+            prop = 'scale'
         else:
             continue
 
-        # Extract keyframes
-        times = []
-        values = []
-        for keyframe in fcurve.keyframe_points:
-            frame = keyframe.co[0]
-            time = (frame - action.frame_range[0]) / bpy.context.scene.render.fps
-            times.append(time)
-            values.append(keyframe.co[1])
+        bone_channels[bone_name][prop][fcurve.array_index] = fcurve
 
-        clip["channels"].append({
-            "jointIndex": joint_idx,
-            "path": path,
-            "times": times,
-            "values": values,
-            "arrayIndex": fcurve.array_index  # 0=x, 1=y, 2=z, 3=w
-        })
+    # Build channels with combined component values
+    for bone_name, props in bone_channels.items():
+        joint_idx = bone_to_index[bone_name]
+
+        for prop, curves in props.items():
+            # Get all unique keyframe times
+            all_times = set()
+            for curve in curves.values():
+                for kf in curve.keyframe_points:
+                    all_times.add(kf.co[0])
+
+            sorted_times = sorted(all_times)
+            times = [(t - frame_start) / fps for t in sorted_times]
+            values = []
+
+            num_components = 4 if prop == 'rotation' else 3
+
+            for frame in sorted_times:
+                for i in range(num_components):
+                    if i in curves:
+                        val = curves[i].evaluate(frame)
+                    else:
+                        # Default values
+                        if prop == 'rotation':
+                            val = 1.0 if i == 0 else 0.0  # !!! ENSURE THIS IS CORRECT
+                        elif prop == 'scale':
+                            val = 1.0
+                        else:
+                            val = 0.0
+                    values.append(val)
+
+            clip["channels"].append({
+                "jointIndex": joint_idx,
+                "path": prop,
+                "times": times,
+                "values": values
+            })
 
     animations[action.name] = clip
 
@@ -267,8 +305,8 @@ ModelPartAData.skeleton = {
 }
 
 ModelPartAData.skinning = {
-  joints = { j0,j1,j2,j3, j0,j1,j2,j3, ... },  -- 4 per vertex
-  weights = { w0,w1,w2,w3, w0,w1,w2,w3, ... }, -- 4 per vertex
+  joints = {  },  -- 4 per vertex
+  weights = { }, -- 4 per vertex
 }
 
 ModelPartAData.animations = {
@@ -303,9 +341,83 @@ return ModelPartAData
 
 ---
 
+## Rive Luau Restrictions for 3D Scripts
+
+⚠️ **CRITICAL**: Rive's Luau environment has limitations that differ from standard Luau.
+
+### 1. table.sort with Custom Comparator NOT SUPPORTED
+
+```luau
+-- ❌ WRONG: Will cause runtime error
+table.sort(self.projectedFaces, function(a, b)
+  return a.depth < b.depth
+end)
+
+-- ✅ CORRECT: Use manual bubble sort
+local faces = self.projectedFaces
+local n = #faces
+for i = 1, n - 1 do
+  for j = 1, n - i do
+    if faces[j].depth > faces[j + 1].depth then
+      faces[j], faces[j + 1] = faces[j + 1], faces[j]
+    end
+  end
+end
+```
+
+### 2. Type Casting for Untyped Data Tables
+
+```luau
+-- ❌ WRONG: Type mismatch error
+local animations = PartAData.animations
+self.currentAnimation = animations["swim"]
+
+-- ✅ CORRECT: Cast through any with explicit type
+local animations = (PartAData :: any).animations :: { [string]: SkelAnim.AnimationClip }?
+if animations then
+  local swimClip = animations["swim"]
+  if swimClip then
+    self.currentAnimation = swimClip
+  end
+end
+```
+
+### 3. Nil-Safe Property Access
+
+```luau
+-- ❌ WRONG: self.skeleton could be nil
+self.skeleton = SkelAnim.buildSkeleton(data)
+print(self.skeleton.jointCount)  -- Error: could be nil
+
+-- ✅ CORRECT: Use local variable to capture non-nil
+local skeleton = SkelAnim.buildSkeleton(data)
+self.skeleton = skeleton
+print(skeleton.jointCount)  -- OK: skeleton is definitely not nil
+```
+
+---
+
+**CRITICAL**: Blender and SkeletalAnimUtil may use different quaternion formats! DOUBLE CHECK ALWAYS!
+
+---
+
+## Common Animation Pitfalls
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Animation explodes/stretches | DOUBLE CHECK SCALE IN BONE TRANSFORMS |
+| Model offset during animation | Wrong IBMs | DOUBLE CHECK IBM CALCULATION |
+| Jerky animation | Missing keyframes | Interpolate in Blender before export |
+| Skinning wrong | Joint index mismatch | Verify 0-indexed joints, weights sum to 1 |
+| table.sort error | Inline comparator | Use manual bubble sort |
+| Type mismatch error | Untyped data | Cast through `any` with explicit type |
+
+---
+
 ## Output Deliverables
 
 Provide functional Luau script(s) that:
+-Pick colors from blender values if available, from screenshot whey it is a texture
 - Render the complete 3D model with all faces visible in Rive
 - Stay within 350-polygon / 500-vertex limit per individual file
 - Split by mesh objects/parts when fragmentation is needed

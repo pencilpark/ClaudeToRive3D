@@ -550,13 +550,64 @@ end
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | **Model explodes during animation** | **Quaternion format mismatch (WXYZ vs XYZW)** | **Blender exports WXYZ `{w,x,y,z}`, convert to XYZW `{x,y,z,w}` for SkeletalAnimUtil** |
+| **Animation amplified/stretched** | **Armature scale ≠ 1 in Blender** | **Extract skeleton with scale=1 (see section below)** |
 | Model explodes | Wrong inverse bind matrices | Check matrix export order (column-major) |
 | Animation wrong speed | Duration mismatch | Verify duration matches last keyframe time |
 | Jerky motion | Missing keyframes | Ensure smooth interpolation in Blender |
 | Wrong rotation | Quaternion sign flip | Use `quatSlerp` for proper interpolation |
 | Joints don't affect mesh | Missing skinning data | Check vertex weights sum to 1.0 |
 | **"could be nil" typecheck** | Accessing `.property` on nullable `self.field` | Use local variable: `local x = func(); self.x = x; print(x.prop)` |
-| **"Expected AnimationClip, got unknown"** | Untyped `animations` table from `any` | Cast: `animations :: { [string]: SkelAnim.AnimationClip }?` |
+| **"Expected AnimationClip, got unknown"** | Untyped `animations` table from `any` | Cast: `(Data :: any).animations :: { [string]: SkelAnim.AnimationClip }?` |
+| **table.sort comparator error** | Inline function in `table.sort` not supported | Use manual bubble sort (see below) |
+| **"Path was modified between draws"** | Calling `path:reset()` in `draw()` | Build paths in `advance()`, store in ProjectedFace, only draw in `draw()` |
+| **"Key joints not found in skeleton"** | Using `skeleton.joints[i]` | Use `skeleton.skinMatrices[i]` - Skeleton type has no `joints` field |
+
+### CRITICAL: Armature Scale Problem
+
+When Blender's armature has `scale ≠ 1` (common in GLB imports), the skeleton transforms get mixed with the scale factor, causing animation to be amplified or distorted.
+
+**Problem scenario:**
+- Armature has scale = 100 (from GLB import)
+- Vertices are normalized to ~200 units (scale factor = 17)
+- Combined scale = 100 × 17 = 1700 gets baked into bone matrices
+- Animation rotations apply at this huge scale, causing explosion
+
+**Solution: Extract skeleton with scale = 1**
+
+```python
+# In Blender Python export script:
+
+# 1. Get normalized bone world matrix
+bone_world = arm_world @ bone.matrix_local
+bone_norm = normalize_mat @ bone_world  # includes center + scale
+
+# 2. Decompose and FORCE scale to 1
+loc, rot, scl = bone_norm.decompose()
+world_mat_no_scale = Matrix.LocRotScale(loc, rot, Vector((1, 1, 1)))
+
+# 3. Calculate local transform relative to parent (also with scale=1)
+if bone.parent:
+    parent_world = arm_world @ bone.parent.matrix_local
+    parent_norm = normalize_mat @ parent_world
+    _, parent_rot, _ = parent_norm.decompose()
+    parent_mat = Matrix.LocRotScale(parent_norm.translation, parent_rot, Vector((1,1,1)))
+    local_mat = parent_mat.inverted() @ world_mat_no_scale
+else:
+    local_mat = world_mat_no_scale
+
+# 4. Extract rest pose from local matrix
+local_loc, local_rot, _ = local_mat.decompose()
+rest_pose = {
+    "translation": [local_loc.x, local_loc.y, local_loc.z],
+    "rotation": [local_rot.w, local_rot.x, local_rot.y, local_rot.z],  # WXYZ
+    "scale": [1.0, 1.0, 1.0]  # ALWAYS 1
+}
+
+# 5. IBM = inverse of world_mat_no_scale
+ibm = world_mat_no_scale.inverted()
+```
+
+**Key insight:** The skeleton works in the SAME normalized space as vertices, with scale=1 everywhere. The normalization scale is already baked into the vertex positions, so the skeleton should NOT re-apply it.
 
 ### CRITICAL: Quaternion Format Conversion
 Blender exports quaternions in **WXYZ** format `{w, x, y, z}`, but `Mesh3DUtil.mat4FromQuat()` expects **XYZW** format `{x, y, z, w}`.
@@ -572,6 +623,182 @@ Blender exports quaternions in **WXYZ** format `{w, x, y, z}`, but `Mesh3DUtil.m
 -- Internal XYZW: { x, y, z, w }
 local blenderQuat = { 1.0, 0.0, 0.0, 0.0 }  -- Identity in WXYZ
 local internalQuat = { blenderQuat[2], blenderQuat[3], blenderQuat[4], blenderQuat[1] }  -- XYZW
+```
+
+### Rive Luau Restrictions for 3D Scripts
+
+**1. CRITICAL: Path modification in draw() is FORBIDDEN**
+```luau
+-- ❌ WRONG: Modifying path in draw() causes "Path was modified between draws"
+local function draw(self: Model, renderer: Renderer)
+    for _, face in ipairs(self.projectedFaces) do
+        self.path:reset()  -- ERROR! Cannot modify in draw()
+        self.path:moveTo(...)
+        renderer:drawPath(self.path, paint)
+    end
+end
+
+-- ✅ CORRECT: Create paths in advance(), store in ProjectedFace
+export type ProjectedFace = {
+    path: Path,  -- Each face has its own pre-built path
+    depth: number,
+    color: Color,
+}
+
+local function processFaces(self: Model, ...)
+    -- Build path here, in advance()
+    local facePath = Path.new()
+    facePath:moveTo(Vector.xy(projected2D[1][1], projected2D[1][2]))
+    for idx = 2, #projected2D do
+        facePath:lineTo(Vector.xy(projected2D[idx][1], projected2D[idx][2]))
+    end
+    facePath:close()
+
+    table.insert(self.projectedFaces, {
+        path = facePath,
+        depth = avgZ,
+        color = litColor,
+    })
+end
+
+local function draw(self: Model, renderer: Renderer)
+    for _, face in ipairs(self.projectedFaces) do
+        local fillPaint = Paint.with({ style = "fill", color = face.color })
+        renderer:drawPath(face.path, fillPaint)  -- Just draw, no modification
+    end
+end
+```
+
+**2. table.sort with custom comparator NOT supported**
+```luau
+-- ❌ WRONG: Rive Luau doesn't support inline comparators
+table.sort(faces, function(a, b)
+  return a.depth < b.depth
+end)
+
+-- ✅ CORRECT: Use manual bubble sort
+local n = #faces
+for i = 1, n - 1 do
+  for j = 1, n - i do
+    if faces[j].depth > faces[j + 1].depth then
+      faces[j], faces[j + 1] = faces[j + 1], faces[j]
+    end
+  end
+end
+```
+
+**2. Type casting for untyped data tables**
+```luau
+-- ❌ WRONG: Direct access to animations table
+local animations = PartAData.animations
+local clip = animations["swim"]
+self.currentAnimation = clip  -- ERROR: type mismatch
+
+-- ✅ CORRECT: Cast through `any` with explicit type
+local animations = (PartAData :: any).animations :: { [string]: SkelAnim.AnimationClip }?
+if animations then
+  local clip = animations["swim"]
+  if clip then
+    self.currentAnimation = clip  -- OK: type is now correct
+  end
+end
+```
+
+**3. Skeleton initialization pattern**
+```luau
+-- ❌ WRONG: Accessing property on potentially nil self.skeleton
+local skeletonData = PartAData.skeleton
+if skeletonData then
+  self.skeleton = SkelAnim.buildSkeleton(skeletonData)
+  print(self.skeleton.jointCount)  -- ERROR: could be nil
+end
+
+-- ✅ CORRECT: Use local variable first
+local skeletonData = PartAData.skeleton
+if skeletonData then
+  local skeleton = SkelAnim.buildSkeleton(skeletonData)
+  self.skeleton = skeleton
+  print(skeleton.jointCount)  -- OK: skeleton is not nil here
+end
+```
+
+**4. Skeleton structure: use skinMatrices NOT joints**
+```luau
+-- ❌ WRONG: skeleton.joints doesn't exist!
+local joint = skeleton.joints[jointIdx]
+local skinMat = joint.skinMatrix
+
+-- ✅ CORRECT: Access skinMatrices directly
+local skinMat = skeleton.skinMatrices[jointIdx]
+if skinMat then
+    local tx, ty, tz = M.mat4TransformPoint(skinMat, v.x, v.y, v.z)
+end
+```
+
+The `Skeleton` type from SkeletalAnimUtil has this structure:
+```luau
+export type Skeleton = {
+  jointCount: number,
+  jointParents: { number? },
+  inverseBindMatrices: { Mat4 },
+  localTransforms: { JointState },
+  worldMatrices: { Mat4 },
+  skinMatrices: { Mat4 },  -- USE THIS for vertex skinning
+}
+```
+
+**5. Skinning data format options**
+
+Two formats exist - choose based on your data structure:
+
+```luau
+-- Format A: Flat arrays (SkeletalAnimUtil.skinVertices expects this)
+ModelData.skinning = {
+  joints = { 0,0,0,0, 1,2,0,0, ... },   -- 4 joint indices per vertex (flat)
+  weights = { 1,0,0,0, 0.5,0.5,0,0, ... }, -- 4 weights per vertex (flat)
+}
+
+-- Format B: Per-vertex objects (requires custom skinVertices function)
+type SkinEntry = { j: { number }, w: { number } }
+ModelData.skinning = {
+  { j = { 0, 1, 9, 6 }, w = { 0.786714, 0.105125, 0.054674, 0.053487 } },
+  { j = { 1, 2, 6, 9 }, w = { 0.873805, 0.06892, 0.036851, 0.020424 } },
+  -- ...
+}
+
+-- Custom skinVertices for Format B:
+local function skinVertices(
+    skeleton: SkelAnim.Skeleton,
+    vertices: { { x: number, y: number, z: number } },
+    skinning: { SkinEntry }
+): { { x: number, y: number, z: number } }
+    local result: { { x: number, y: number, z: number } } = {}
+
+    for i, v in ipairs(vertices) do
+        local skin = skinning[i]
+        local sx, sy, sz = 0.0, 0.0, 0.0
+
+        for k = 1, 4 do
+            local jointIdx = skin.j[k] + 1  -- 0-based to 1-based
+            local weight = skin.w[k]
+
+            if weight > 0 and jointIdx >= 1 and jointIdx <= skeleton.jointCount then
+                local skinMat = skeleton.skinMatrices[jointIdx]
+                if skinMat then
+                    local tx, ty, tz = M.mat4TransformPoint(skinMat, v.x, v.y, v.z)
+                    sx = sx + tx * weight
+                    sy = sy + ty * weight
+                    sz = sz + tz * weight
+                end
+            end
+        end
+
+        local vert: { x: number, y: number, z: number } = { x = sx, y = sy, z = sz }
+        table.insert(result, vert)
+    end
+
+    return result
+end
 ```
 
 ### Mesh3DUtil Functions (Reference)
@@ -903,13 +1130,15 @@ local childEvent = PointerEvent.new(event.id, transformedPos)
 ## Performance Rules
 
 ### DO
-- Create Path/Paint **once** in `init()`
-- Rebuild geometry in `update()` using `path:reset()`
-- Keep `draw()` lightweight (render only)
+- Create Path/Paint **once** in `init()` for static shapes
+- For dynamic 3D: create paths in `advance()`, store in data structures
+- Rebuild geometry in `update()` using `path:reset()` (NOT in `draw()`)
+- Keep `draw()` lightweight (render only, NO modifications)
 - Reuse objects, pool particles
 - Use `lengthSquared()` for distance comparisons
 
 ### DON'T
+- **NEVER** call `path:reset()` or modify paths in `draw()`
 - Allocate in `draw()` or tight loops
 - `print()` in loops
 - Define functions inside lifecycle callbacks
@@ -921,9 +1150,33 @@ function draw(self, renderer)
     local path = Path.new()  -- NO!
 end
 
--- GOOD: reuse
+-- BAD: modifying path in draw()
+function draw(self, renderer)
+    self.path:reset()  -- NO! Causes "Path was modified between draws"
+    self.path:moveTo(...)
+end
+
+-- GOOD: for static shapes
 function draw(self, renderer)
     renderer:drawPath(self.path, self.paint)
+end
+
+-- GOOD: for dynamic 3D (paths created in advance)
+function advance(self, seconds)
+    self.projectedFaces = {}
+    for _, face in ipairs(faces) do
+        local facePath = Path.new()
+        facePath:moveTo(...)
+        facePath:close()
+        table.insert(self.projectedFaces, { path = facePath, color = c })
+    end
+    return true
+end
+
+function draw(self, renderer)
+    for _, face in ipairs(self.projectedFaces) do
+        renderer:drawPath(face.path, Paint.with({ color = face.color }))
+    end
 end
 ```
 
@@ -940,6 +1193,8 @@ end
 | Forgetting `markNeedsUpdate()` | Call it in listeners/callbacks |
 | Unbalanced `save()`/`restore()` | Always pair them |
 | Color via `c.red` | Use `Color.red(c)` (static) |
+| **Modifying Path in `draw()`** | **Build paths in `advance()`, only render in `draw()`** |
+| **`path:reset()` in `draw()`** | **Causes "Path was modified between draws" error** |
 
 ---
 
