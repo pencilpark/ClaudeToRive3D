@@ -11,5 +11,5 @@ Mandatory:
 
 https://blender-mcp.com/
 
-& Claude Code by Anthropic
+& Claude Code by Anthropic (or other robust model)
 
