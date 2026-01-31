@@ -241,40 +241,67 @@ Mesh3DUtil.luau      -- Util: shared 3D math functions
 ```
 
 ### Property Group Template (3D Node Script)
+
+**IMPORTANT:** Parameters must match 3DHandler.luau for consistency.
+
 ```luau
 export type Model3D = {
   -- Rotation controls
-  rotationSpeed: Input<number>,
-  baseRotationX: Input<number>,
-  baseRotationY: Input<number>,
-  baseRotationZ: Input<number>,
-  joystickPitch: Input<number>,
-  joystickYaw: Input<number>,
-  joystickRoll: Input<number>,
-  -- Scale and projection
-  scale: Input<number>,
-  fov: Input<number>,
-  -- Anchor position
-  baseAnchorX: Input<number>,
-  baseAnchorY: Input<number>,
-  baseAnchorZ: Input<number>,
-  anchorOffsetX: Input<number>,
-  anchorOffsetY: Input<number>,
-  anchorOffsetZ: Input<number>,
-  -- Rendering
-  brightness: Input<number>,
-  faceExpansion: Input<number>,
-  -- Material colors (one Input<Color> per category)
-  primaryColor: Input<Color>,    -- c=1
-  secondaryColor: Input<Color>,  -- c=2
-  accentColor: Input<Color>,     -- c=3
-  highlightColor: Input<Color>,  -- c=4
-  edgeColor: Input<Color>,       -- c=5
-  -- Internal state
+  rotationSpeed: Input<number>,      -- Auto-rotation speed (0 = disabled)
+  baseRotationX: Input<number>,      -- Pitch in degrees
+  baseRotationY: Input<number>,      -- Yaw in degrees
+  baseRotationZ: Input<number>,      -- Roll in degrees
+  joystickPitch: Input<number>,      -- Interactive pitch offset
+  joystickYaw: Input<number>,        -- Interactive yaw offset
+  joystickRoll: Input<number>,       -- Interactive roll offset
+  -- Scale and projection (MUST match 3DHandler defaults)
+  scale: Input<number>,              -- Multiplier on autoScale (default: 1)
+  fov: Input<number>,                -- Field of view for perspective (default: 800)
+  cameraDistance: Input<number>,     -- Camera distance for perspective (default: 400)
+  usePerspective: Input<boolean>,    -- false = orthographic, true = perspective (default: false)
+  -- Anchor position (model center, divided by 100 internally)
+  anchorX: Input<number>,
+  anchorY: Input<number>,
+  anchorZ: Input<number>,
+  -- Rendering (MUST match 3DHandler defaults)
+  brightness: Input<number>,         -- 0-100, divided by 100 (default: 30 = 0.3)
+  faceExpansion: Input<number>,      -- Expand faces from centroid (default: 0.005)
+  backfaceCulling: Input<boolean>,   -- Hide back faces (default: true)
+  wireframe: Input<boolean>,         -- Show wireframe (default: false)
+  -- Animation controls
+  animationEnabled: Input<boolean>,
+  animationName: Input<string>,
+  animationSpeed: Input<number>,
+  -- Material colors (one Input<Color> per category, RGBA supported)
+  primaryColor: Input<Color>,        -- c=1
+  secondaryColor: Input<Color>,      -- c=2
+  accentColor: Input<Color>,         -- c=3
+  highlightColor: Input<Color>,      -- c=4
+  edgeColor: Input<Color>,           -- c=5
+  -- Internal state (auto-calculated)
   autoAngleY: number,
+  autoScale: number,                 -- Computed: 200 / maxDimension
+  boundMinX: number,                 -- Bounding box
+  boundMaxX: number,
+  boundMinY: number,
+  boundMaxY: number,
+  boundMinZ: number,
+  boundMaxZ: number,
   projectedFaces: { ProjectedFace },
 }
 ```
+
+### Default Values (matching 3DHandler.luau)
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `scale` | 1 | Multiplier on autoScale (1 = fit to ~200px) |
+| `fov` | 800 | Field of view for perspective mode |
+| `cameraDistance` | 400 | Camera distance for perspective mode |
+| `usePerspective` | false | false = orthographic (cleaner), true = perspective |
+| `brightness` | 30 | Divided by 100 internally (30 = 0.3) |
+| `faceExpansion` | 0.005 | Expand faces to eliminate z-fighting gaps |
+| `backfaceCulling` | true | Hide faces pointing away from camera |
+| `wireframe` | false | Show wireframe instead of filled faces |
 
 ### Color Mapping Function
 ```luau
@@ -294,9 +321,63 @@ end
 | Faces manquantes | Wrong winding order | Reverse vertex order in transformFaceVerts |
 | Couleurs incorrectes | Using RGB instead of category | Use `c = index` format in face data |
 | Script trop lourd | >350 polygons | Fragment into multiple data files |
-| Z-fighting | Faces at same depth | Adjust `faceExpansion` parameter |
-| Model offset | Wrong anchor point | Adjust `baseAnchorX/Y/Z` values |
+| Z-fighting | Faces at same depth | Adjust `faceExpansion` parameter (default: 0.005) |
+| Model offset | Wrong anchor point | Use `anchorX/Y/Z` or let auto-center compute from bounds |
+| Model too small/large | Wrong scale | Use `autoScale` calculation: `200 / maxDimension` |
+| Perspective distortion | Using perspective | Set `usePerspective = false` for cleaner orthographic view |
+| Too dark/bright | Wrong brightness | Use `brightness = 30` (divided by 100 = 0.3) |
 | **"Code too complex to typecheck"** | **Shared vertices across all parts** | **Extract only used vertices per part + remap indices** |
+
+### Critical: Parameter Consistency with 3DHandler.luau
+
+When creating 3D Node Scripts, parameters **MUST** match 3DHandler.luau defaults for consistent behavior:
+
+```luau
+-- Factory return values (matching 3DHandler)
+return {
+  scale = 1,              -- NOT 30! Uses autoScale multiplier
+  fov = 800,              -- NOT 300!
+  cameraDistance = 400,   -- REQUIRED for perspective
+  usePerspective = false, -- REQUIRED, default = orthographic
+  brightness = 30,        -- NOT 0.4! Divided by 100 internally
+  faceExpansion = 0.005,
+  backfaceCulling = true,
+  wireframe = false,
+  -- ...
+}
+```
+
+### Projection Function (matching 3DHandler)
+```luau
+local function project(x, y, z, fov, distance, usePerspective)
+  if usePerspective and distance + z > 0.001 then
+    local factor = fov / (distance + z)
+    return x * factor, y * factor
+  else
+    -- Orthographic: just return x, y (scale already applied)
+    return x, y
+  end
+end
+```
+
+### Transform Function (GLB-style Y-up coordinates)
+```luau
+local function transformVertex(vx, vy, vz, ax, ay, az, cosX, sinX, cosY, sinY, cosZ, sinZ)
+  local x, y, z = vx - ax, vy - ay, vz - az
+  -- Yaw (Y rotation)
+  local rx = x * cosY + z * sinY
+  local rz = -x * sinY + z * cosY
+  x, z = rx, rz
+  -- Pitch (X rotation)
+  local ry = y * cosX - z * sinX
+  local rz2 = y * sinX + z * cosX
+  y, z = ry, rz2
+  -- Roll (Z rotation)
+  local rx2 = x * cosZ - y * sinZ
+  local ry2 = x * sinZ + y * cosZ
+  return rx2, ry2, z
+end
+```
 
 ---
 
@@ -407,6 +488,52 @@ SkelAnim.blendAnimations(skeleton, clipA, clipB, timeA, timeB, blendFactor)
 SkelAnim.resetToRestPose(skeleton, data.skeleton.restPose)
 ```
 
+### Skeleton Initialization Pattern (Nil-Safe)
+
+**CRITICAL:** When initializing skeleton and animations, avoid accessing properties on nullable types. Use local variables to capture non-nil values:
+
+```luau
+-- ❌ WRONG: self.skeleton could be nil when accessing jointCount
+local function initSkeleton(self: Model3D)
+  local skeletonData = (DataFile :: any).skeleton
+  if skeletonData then
+    self.skeleton = SkelAnim.buildSkeleton(skeletonData)
+    print("Joints:", self.skeleton.jointCount)  -- ERROR: could be nil
+
+    local animations = (DataFile :: any).animations
+    if animations then
+      self.currentAnimation = animations["idle"]
+      print("Duration:", self.currentAnimation.duration)  -- ERROR: could be nil
+    end
+  end
+end
+
+-- ✅ CORRECT: Use local variables to capture non-nil values
+local function initSkeleton(self: Model3D)
+  local skeletonData = (DataFile :: any).skeleton
+  if skeletonData then
+    local skeleton = SkelAnim.buildSkeleton(skeletonData)
+    self.skeleton = skeleton
+    print("Joints:", skeleton.jointCount)  -- OK: skeleton is not nil here
+
+    -- Cast animations to proper type for type safety
+    local animations = (DataFile :: any).animations :: { [string]: SkelAnim.AnimationClip }?
+    if animations then
+      local clip = animations["idle"]
+      if clip then
+        self.currentAnimation = clip
+        print("Duration:", clip.duration)  -- OK: clip is not nil here
+      end
+    end
+  end
+end
+```
+
+**Key patterns:**
+1. Store function result in local variable before assigning to `self`
+2. Use type cast `:: { [string]: SkelAnim.AnimationClip }?` for untyped data
+3. Always check if value exists before accessing its properties
+
 ### Blender Export Workflow for Animations
 
 1. **Rig your model** with an Armature
@@ -422,11 +549,30 @@ SkelAnim.resetToRestPose(skeleton, data.skeleton.restPose)
 ### Animation Pitfalls
 | Issue | Cause | Solution |
 |-------|-------|----------|
+| **Model explodes during animation** | **Quaternion format mismatch (WXYZ vs XYZW)** | **Blender exports WXYZ `{w,x,y,z}`, convert to XYZW `{x,y,z,w}` for SkeletalAnimUtil** |
 | Model explodes | Wrong inverse bind matrices | Check matrix export order (column-major) |
 | Animation wrong speed | Duration mismatch | Verify duration matches last keyframe time |
 | Jerky motion | Missing keyframes | Ensure smooth interpolation in Blender |
 | Wrong rotation | Quaternion sign flip | Use `quatSlerp` for proper interpolation |
 | Joints don't affect mesh | Missing skinning data | Check vertex weights sum to 1.0 |
+| **"could be nil" typecheck** | Accessing `.property` on nullable `self.field` | Use local variable: `local x = func(); self.x = x; print(x.prop)` |
+| **"Expected AnimationClip, got unknown"** | Untyped `animations` table from `any` | Cast: `animations :: { [string]: SkelAnim.AnimationClip }?` |
+
+### CRITICAL: Quaternion Format Conversion
+Blender exports quaternions in **WXYZ** format `{w, x, y, z}`, but `Mesh3DUtil.mat4FromQuat()` expects **XYZW** format `{x, y, z, w}`.
+
+**SkeletalAnimUtil handles this automatically** for:
+- Rest pose rotations (in `buildSkeleton`)
+- Animation keyframe rotations (in `sampleQuat`)
+- Reset to rest pose (in `resetToRestPose`)
+
+**If exporting raw data from Blender, quaternions must be converted:**
+```luau
+-- Blender WXYZ: { w, x, y, z }
+-- Internal XYZW: { x, y, z, w }
+local blenderQuat = { 1.0, 0.0, 0.0, 0.0 }  -- Identity in WXYZ
+local internalQuat = { blenderQuat[2], blenderQuat[3], blenderQuat[4], blenderQuat[1] }  -- XYZW
+```
 
 ### Mesh3DUtil Functions (Reference)
 ```luau
