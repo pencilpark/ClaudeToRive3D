@@ -8,6 +8,10 @@ Import rigged 3D models with skeletal animations from Blender into Rive using Lu
 
 ---
 
+## VIDEO TUTORIAL
+https://x.com/fredberria/status/2016568637310513207?s=20
+
+---
 ## Table of Contents
 
 1. [Overview](#overview)
@@ -399,5 +403,5 @@ MIT License - Feel free to use in personal and commercial projects.
 ## Credits
 
 - Pipeline developed by Fred Berria & Claude
-- Built for the Rive Ambassador program
+- Inspired by Luigi Rosso's approach (Rive coFounder)
 - LERP documentation: https://forge.mograph.life/apps/lerp/
