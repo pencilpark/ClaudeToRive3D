@@ -1,12 +1,12 @@
 --!strict
--- MantaRay.luau
--- Main Node Script for animated MantaRay 3D model
+-- example.luau
+-- Main Node Script for animated example 3D model
 -- 696 faces total (348 Part A + 348 Part B), 13 bones, swim animation
 
 local SkelAnim = require("SkeletalAnimUtil")
 local M = require("Mesh3DUtil")
-local PartAData = require("MantaRayPartAData")
-local PartBData = require("MantaRayPartBData")
+local PartAData = require("examplePartAData")
+local PartBData = require("examplePartBData")
 
 -- Type for skinning entry format
 type SkinEntry = { j: { number }, w: { number } }
@@ -18,7 +18,7 @@ export type ProjectedFace = {
     color: Color,
 }
 
-export type MantaRay = {
+export type example = {
     -- Rotation controls
     rotationSpeed: Input<number>,
     baseRotationX: Input<number>,
@@ -69,7 +69,7 @@ local function toRadians(degrees: number): number
     return degrees * math.pi / 180
 end
 
-local function getTintColor(self: MantaRay, category: number): Color
+local function getTintColor(self: example, category: number): Color
     if category == 1 then
         return self.bottomColor
     else
@@ -133,7 +133,7 @@ local function calculateLighting(nx: number, ny: number, nz: number, brightness:
     return math.max(brightness, math.min(1.0, brightness + (1 - brightness) * math.max(0, dot)))
 end
 
-local function initSkeleton(self: MantaRay)
+local function initSkeleton(self: example)
     local skeletonData = (PartAData :: any).skeleton
     if skeletonData then
         local skeleton = SkelAnim.buildSkeleton(skeletonData)
@@ -169,7 +169,7 @@ local function initSkeleton(self: MantaRay)
     end
 end
 
-local function updateAnimation(self: MantaRay)
+local function updateAnimation(self: example)
     -- Check if animation name changed via Input
     if self.animationName ~= self.lastAnimationName and self.animations then
         local animations = self.animations
@@ -217,7 +217,7 @@ local function skinVertices(
 end
 
 local function processFaces(
-    self: MantaRay,
+    self: example,
     vertices: { { x: number, y: number, z: number } },
     faces: { { verts: { number }, c: number } },
     ax: number, ay: number, az: number,
@@ -319,7 +319,7 @@ local function processFaces(
 end
 
 -- Lifecycle functions
-local function init(self: MantaRay, context: Context): boolean
+local function init(self: example, context: Context): boolean
     self.fillPaint = Paint.with({ style = "fill", color = Color.rgb(128, 128, 128) })
     self.strokePaint = Paint.with({ style = "stroke", color = Color.rgb(0, 0, 0), thickness = 1 })
 
@@ -364,7 +364,7 @@ local function init(self: MantaRay, context: Context): boolean
     return true
 end
 
-local function advance(self: MantaRay, seconds: number): boolean
+local function advance(self: example, seconds: number): boolean
     -- Auto rotation
     if self.rotationSpeed ~= 0 then
         self.autoAngleY = self.autoAngleY + self.rotationSpeed * seconds
@@ -459,7 +459,7 @@ local function advance(self: MantaRay, seconds: number): boolean
     return true
 end
 
-local function draw(self: MantaRay, renderer: Renderer)
+local function draw(self: example, renderer: Renderer)
     for _, face in ipairs(self.projectedFaces) do
         if self.wireframe then
             local strokePaint = Paint.with({ style = "stroke", color = face.color, thickness = 1 })
@@ -471,7 +471,7 @@ local function draw(self: MantaRay, renderer: Renderer)
     end
 end
 
-return function(): Node<MantaRay>
+return function(): Node<example>
     return {
         -- Rotation controls
         rotationSpeed = 0,
