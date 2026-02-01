@@ -6,20 +6,28 @@
   Use this with data files that contain skeleton, skinning, and animation data
   extracted from Blender.
 
+  IMPORTANT: QUATERNION FORMAT
+  Blender exports quaternions in WXYZ format: {w, x, y, z}
+  This module internally uses XYZW format: {x, y, z, w}
+  Conversion is handled automatically in:
+    - buildSkeleton() for rest pose
+    - sampleQuat() for animation keyframes
+    - resetToRestPose() for rest pose reset
+
   REQUIRED DATA STRUCTURE IN YOUR DATA FILES:
 
   ModelData.skeleton = {
     jointCount = 5,
     jointParents = { nil, 1, 2, 2, 1 },  -- nil for root joints
-    inverseBindMatrices = { {...}, {...}, ... },  -- 16 floats per joint (Mat4)
-    restPose = {  -- Initial TRS per joint
-      { translation = {0,0,0}, rotation = {0,0,0,1}, scale = {1,1,1} },
+    inverseBindMatrices = { {...}, {...}, ... },  -- 16 floats per joint (Mat4, column-major)
+    restPose = {  -- Initial TRS per joint (rotation in WXYZ format from Blender)
+      { translation = {0,0,0}, rotation = {1,0,0,0}, scale = {1,1,1} },  -- w,x,y,z
       ...
     },
   }
 
   ModelData.skinning = {
-    joints = { 0,0,0,0, 1,2,0,0, ... },  -- 4 joint indices per vertex
+    joints = { 0,0,0,0, 1,2,0,0, ... },  -- 4 joint indices per vertex (0-based)
     weights = { 1,0,0,0, 0.5,0.5,0,0, ... },  -- 4 weights per vertex
   }
 
@@ -27,7 +35,7 @@
     ["idle"] = {
       duration = 2.0,
       channels = {
-        { jointIndex = 1, path = "rotation", times = {0, 1, 2}, values = {...} },
+        { jointIndex = 1, path = "rotation", times = {0, 1, 2}, values = {...} },  -- values in WXYZ
         ...
       },
     },
@@ -65,6 +73,7 @@ export type Skeleton = {
   localTransforms: { JointState },  -- current animated transforms
   worldMatrices: { Mat4 },  -- computed world transform per joint
   skinMatrices: { Mat4 },  -- final skinning matrices (world * inverseBind)
+  scaleCorrection: number,  -- unit correction factor (e.g., 100 for matrices exported at 0.01 scale)
 }
 
 -- Animation channel
@@ -96,21 +105,69 @@ local SkeletalAnimUtil = {}
 -- ============================================================================
 
 function SkeletalAnimUtil.buildSkeleton(data: SkeletonData): Skeleton
+  local jointCount = data.jointCount
+
+  -- Blender IBMs have armature scale baked in (0.01 in rotation part)
+  -- We need to normalize the rotation part to scale 1.0
+  -- This is done by dividing the rotation/scale part by the scale factor
+
+  -- Detect scale from first IBM diagonal
+  local ibmScale = 1.0
+  if jointCount > 0 and data.inverseBindMatrices[1] then
+    local ibm = data.inverseBindMatrices[1]
+    -- Column 0 length (should be ~1 for pure rotation)
+    local col0Len = math.sqrt((ibm[1] or 0)^2 + (ibm[2] or 0)^2 + (ibm[3] or 0)^2)
+    if col0Len > 0.001 and col0Len < 0.5 then
+      ibmScale = col0Len
+      print(string.format("[SkeletalAnimUtil] Detected IBM scale: %.4f", ibmScale))
+    end
+  end
+
+  -- Copy and normalize inverse bind matrices
+  local ibms: { Mat4 } = {}
+  for i = 1, jointCount do
+    local srcMat = data.inverseBindMatrices[i]
+    local mat: Mat4 = {}
+    for j = 1, 16 do
+      mat[j] = srcMat[j] or 0
+    end
+
+    -- Normalize rotation columns (indices 1-3, 5-7, 9-11)
+    if ibmScale ~= 1.0 then
+      local invScale = 1.0 / ibmScale
+      mat[1] = mat[1] * invScale
+      mat[2] = mat[2] * invScale
+      mat[3] = mat[3] * invScale
+      mat[5] = mat[5] * invScale
+      mat[6] = mat[6] * invScale
+      mat[7] = mat[7] * invScale
+      mat[9] = mat[9] * invScale
+      mat[10] = mat[10] * invScale
+      mat[11] = mat[11] * invScale
+      -- Translation stays the same (it's already in the correct space)
+    end
+
+    ibms[i] = mat
+  end
+
   local skeleton: Skeleton = {
-    jointCount = data.jointCount,
+    jointCount = jointCount,
     jointParents = data.jointParents,
-    inverseBindMatrices = data.inverseBindMatrices,
+    inverseBindMatrices = ibms,
     localTransforms = {},
     worldMatrices = {},
     skinMatrices = {},
+    scaleCorrection = ibmScale,
   }
 
   -- Initialize transforms from rest pose
-  for i = 1, data.jointCount do
+  -- Blender quaternions are WXYZ {w, x, y, z}, mat4FromQuat expects XYZW {x, y, z, w}
+  for i = 1, jointCount do
     local rest = data.restPose[i]
     skeleton.localTransforms[i] = {
       translation = { rest.translation[1], rest.translation[2], rest.translation[3] },
-      rotation = { rest.rotation[1], rest.rotation[2], rest.rotation[3], rest.rotation[4] },
+      -- WXYZ to XYZW: {w,x,y,z} -> {x,y,z,w}
+      rotation = { rest.rotation[2], rest.rotation[3], rest.rotation[4], rest.rotation[1] },
       scale = { rest.scale[1], rest.scale[2], rest.scale[3] },
     }
     skeleton.worldMatrices[i] = M.mat4Identity()
@@ -184,14 +241,16 @@ local function sampleVec3(times: { number }, values: { number }, time: number): 
 end
 
 -- Sample a Quat channel at given time
+-- Blender animation values are WXYZ {w,x,y,z,...}, mat4FromQuat expects XYZW {x,y,z,w}
 local function sampleQuat(times: { number }, values: { number }, time: number): Quat
   local idx, t = findKeyframe(times, time)
   local i0 = (idx - 1) * 4
+  -- WXYZ to XYZW
   local q0: Quat = {
-    values[i0 + 1] or 0,
-    values[i0 + 2] or 0,
-    values[i0 + 3] or 0,
-    values[i0 + 4] or 1,
+    values[i0 + 2] or 0,  -- x
+    values[i0 + 3] or 0,  -- y
+    values[i0 + 4] or 0,  -- z
+    values[i0 + 1] or 1,  -- w
   }
 
   if t == 0 or idx >= #times then
@@ -200,10 +259,10 @@ local function sampleQuat(times: { number }, values: { number }, time: number): 
 
   local i1 = idx * 4
   local q1: Quat = {
-    values[i1 + 1] or 0,
-    values[i1 + 2] or 0,
-    values[i1 + 3] or 0,
-    values[i1 + 4] or 1,
+    values[i1 + 2] or 0,  -- x
+    values[i1 + 3] or 0,  -- y
+    values[i1 + 4] or 0,  -- z
+    values[i1 + 1] or 1,  -- w
   }
 
   return M.quatSlerp(q0, q1, t)
@@ -252,7 +311,11 @@ function SkeletalAnimUtil.updateSkeleton(skeleton: Skeleton)
     end
 
     skeleton.worldMatrices[jointIdx] = worldMat
-    skeleton.skinMatrices[jointIdx] = M.mat4Multiply(worldMat, skeleton.inverseBindMatrices[jointIdx])
+
+    -- skinMatrix = worldMatrix * inverseBindMatrix
+    -- This should transform vertices from bind pose to current pose
+    local ibm = skeleton.inverseBindMatrices[jointIdx]
+    skeleton.skinMatrices[jointIdx] = M.mat4Multiply(worldMat, ibm)
   end
 end
 
@@ -390,11 +453,12 @@ end
 -- ============================================================================
 
 function SkeletalAnimUtil.resetToRestPose(skeleton: Skeleton, restPose: { JointState })
+  -- Blender quaternions are WXYZ, convert to XYZW
   for i = 1, skeleton.jointCount do
     local rest = restPose[i]
     local t = skeleton.localTransforms[i]
     t.translation = { rest.translation[1], rest.translation[2], rest.translation[3] }
-    t.rotation = { rest.rotation[1], rest.rotation[2], rest.rotation[3], rest.rotation[4] }
+    t.rotation = { rest.rotation[2], rest.rotation[3], rest.rotation[4], rest.rotation[1] }
     t.scale = { rest.scale[1], rest.scale[2], rest.scale[3] }
   end
 end
