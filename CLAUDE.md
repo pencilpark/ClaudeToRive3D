@@ -1,4 +1,114 @@
-# RIVE LUAU SCRIPTING — CLAUDE.md
+# Blender to Rive 3D Animation Pipeline
+
+> **Quick Start:** Run `blender_to_rive.py` in Blender → Copy generated `.luau` files to Rive → Set `animationName` Input
+
+## Workflow Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        BLENDER                               │
+├─────────────────────────────────────────────────────────────┤
+│  1. Rig mesh with Armature                                  │
+│  2. Paint vertex weights                                    │
+│  3. Create animations (Actions in Action Editor)            │
+│  4. Configure blender_to_rive.py (MODEL_NAME, TARGET_SIZE)  │
+│  5. Run script (Alt+P) → generates *Data.luau files         │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                         RIVE                                 │
+├─────────────────────────────────────────────────────────────┤
+│  1. Copy utility scripts (Mesh3DUtil.luau, SkeletalAnimUtil.luau)
+│  2. Copy generated *Data.luau files                         │
+│  3. Create/adapt main Node Script with Property Group       │
+│  4. Set animationName Input to select animation             │
+│  5. Control via State Machine or external triggers          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Required Files
+
+```
+project/
+├── blender_to_rive.py       # Blender export script (run in Blender)
+├── Mesh3DUtil.luau          # 3D math utilities (Mat4, quaternions)
+├── SkeletalAnimUtil.luau    # Skeleton building, animation, skinning
+├── Model.luau               # Main Node Script (rendering)
+├── ModelPartAData.luau      # Generated: vertices, faces, skeleton, animations
+├── ModelPartBData.luau      # Generated: additional parts if fragmented
+└── CLAUDE.md                # This documentation
+```
+
+## Critical Lessons Learned
+
+### 1. Coordinate Space Consistency (CRITICAL)
+**ALL data MUST be in the SAME normalized coordinate space:**
+- Before fix: IBMs had Z=-41.9, rest pose had Z=+13.6 → Model twisted
+- After fix: ALL data uses same `normalize_mat` → Works perfectly
+
+### 2. Animation Format
+- **Wrong:** Storing animations as deltas from rest pose
+- **Correct:** Animations store FINAL local transforms
+- `sampleAnimation()` REPLACES localTransforms directly
+
+### 3. Quaternion Format
+- **Blender exports:** WXYZ `{w, x, y, z}`
+- **SkeletalAnimUtil expects:** XYZW `{x, y, z, w}`
+- Conversion handled automatically by SkeletalAnimUtil
+
+### 4. Scale = 1 Rule
+Always force scale to 1 on bone matrices to prevent animation amplification.
+
+### 5. Animation Name
+Animation names from Blender use format `"Armature|ActionName"`. Set the `animationName` Input to match exactly.
+
+---
+
+## Claude Code Guidelines
+
+### 1. Plan Mode Default
+Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)If something goes sideways, STOP and re-plan immediately - don't keep pushingUse plan mode for verification steps, not just buildingWrite detailed specs upfront to reduce ambiguity
+
+### 2. Subagent Strategy to keep main context window clean
+Offload research, exploration, and parallel analysis to subagentsFor complex problems, throw more compute at it via subagentsOne task per subagent for focused execution
+
+### 3. Self-Improvement Loop
+After ANY correction from the user: update 'tasks/lessons.md' with the patternWrite rules for yourself that prevent the same mistakeRuthlessly iterate on these lessons until mistake rate dropsReview lessons at session start for relevant project
+
+### 4. Verification Before Done
+Never mark a task complete without proving it worksDiff behavior between main and your changes when relevantAsk yourself: "Would a staff engineer approve this?"Run tests, check logs, demonstrate correctness
+
+### 5. Demand Elegance (Balanced)
+For non-trivial changes: pause and ask "is there a more elegant way?"If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"Skip this for simple, obvious fixes - don't over-engineerChallenge your own work before presenting it
+
+### 6. Autonomous Bug Fixing
+When given a bug report: just fix it. Don't ask for hand-holdingPoint at logs, errors, failing tests -> then resolve themZero context switching required from the userGo fix failing CI tests without being told how
+
+## Task Management
+**Plan First**:
+Write plan to 'tasks/todo.md' with checkable items
+**Verify Plan**:
+Check in before starting implementation
+**Track Progress**:
+Mark items complete as you go
+**Explain Changes**:
+High-level summary at each step
+**Document Results**:
+Add review to 'tasks/todo.md'
+**Capture Lessons**:
+Update 'tasks/lessons.md' after corrections
+
+## Core Principles
+**Simplicity First**:
+Make every change as simple as possible. Impact minimal code.
+**No Laziness**:
+Find root causes. No temporary fixes. Senior developer standards.
+**Minimal Impact**:
+Changes should only touch what's necessary. Avoid introducing bugs.
+
+
+
+# RIVE LUAU SCRIPTING 
 
 ## Identity
 AI assistant for Rive scripting in **pure Luau** (no Roblox libraries).
