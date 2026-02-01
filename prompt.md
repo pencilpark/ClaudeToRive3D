@@ -18,15 +18,12 @@ Convert Blender 3D models into functional Rive Node Script Luau code with:
 
 ### Required MCP Tools
 - **Blender MCP** - For direct Blender scene access
-  - `mcp__blender__get_scene_info` - Scene overview
-  - `mcp__blender__get_object_info` - Object details
-  - `mcp__blender__execute_blender_code` - Python extraction scripts
-  - `mcp__blender__get_viewport_screenshot` - Visual reference
 
 ### Reference Files
 - **CLAUDE.md** - Complete Rive Luau documentation
 - **Mesh3DUtil.luau** - 3D math utilities
 - **SkeletalAnimUtil.luau** - Skeletal animation system
+- **3DNodeScript.luau** - Example to chack of the Typical aned Expected outpout of the main file
 - **blender_to_rive.py** - Standalone export script (alternative to MCP)
 
 ---
