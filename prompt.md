@@ -4,13 +4,37 @@
 
 ---
 
+## ⚠️ STOP! Before You Start
+
+**Read these 5 rules or face hours of debugging:**
+
+1. **DON'T require Mesh3DUtil for static models** - Inline the math functions
+2. **USE `c=index` format** - NOT RGB colors (60% file size reduction)
+3. **SORT faces by avgZ** - At export time, then bubble sort at runtime
+4. **STORE `context`** - Required for `markNeedsUpdate()` (auto-rotation)
+5. **BLENDER Z-UP**: Yaw = XY rotation, NOT Y-axis rotation
+
+---
+
 ## Your Task
 
 Convert Blender 3D models into functional Rive Node Script Luau code with:
-- Automatic polygon-based fragmentation (>350 faces)
+- Automatic polygon-based fragmentation (>1900 faces per file with indexed colors)
 - Skeletal animation support (if Armature present)
-- Material-to-color category conversion
+- Material-to-color category conversion (using UV coordinates for texture atlases)
 - Vertex index optimization per fragment
+- Depth sorting for painter's algorithm
+
+---
+
+## UPDATED Limits (Landscape Export Lessons)
+
+| Parameter | OLD Value | NEW Value | Notes |
+|-----------|-----------|-----------|-------|
+| Max faces/file | 600 | **1900** | Using `c=index` instead of RGB |
+| Max vertices/file | 750 | **2500** | With vertex optimization per part |
+
+**Key insight**: Using category index `c=1` instead of `color={r,g,b}` reduces file size by ~60%, allowing more faces per file.
 
 ---
 
@@ -264,11 +288,12 @@ print(json.dumps(animations, indent=2))
 
 ## Critical Constraints
 
-### Polygon/Vertex Limits
-- **Maximum 350 polygons** per Luau script file
-- **Maximum 500 vertices** per Luau script file
+### Polygon/Vertex Limits (UPDATED)
+- **Maximum ~1900 polygons** per Luau script file (with indexed colors)
+- **Maximum ~2500 vertices** per Luau script file
 - Auto-fragment by mesh parts when exceeded
 - **Each fragment must contain ONLY its used vertices** (remap indices)
+- **Use category index `c=1` NOT RGB colors** - reduces file size significantly
 
 ### Coordinate Space Consistency
 ALL data MUST be in the SAME normalized space:
@@ -458,11 +483,100 @@ export type Model3D = {
 
 Provide functional Luau scripts that:
 - Render complete 3D model with all faces visible
-- Stay within 350-polygon / 500-vertex limit per file
+- Stay within ~1900-polygon / ~2500-vertex limit per file (using indexed colors)
 - Include skeleton/skinning/animation if Armature present
 - Expose properties in Property Group (transforms, colors, animation)
 - Use meaningful color input names from Blender materials
 - Are immediately usable in Rive without modification
+
+---
+
+## Depth Sorting (Painter's Algorithm)
+
+**CRITICAL**: Faces must be sorted back-to-front for correct rendering.
+
+### What Works
+```python
+# At export time in Blender
+def face_avg_z(face):
+    return sum(vertices[vi-1]['z'] for vi in face['verts']) / len(face['verts'])
+all_faces.sort(key=face_avg_z)
+```
+
+```luau
+-- At runtime in Rive (bubble sort)
+for i = 1, n - 1 do
+  for j = 1, n - i do
+    if faces[j].depth > faces[j + 1].depth then
+      faces[j], faces[j + 1] = faces[j + 1], faces[j]
+    end
+  end
+end
+```
+
+### What DOESN'T Work
+- **BSP trees**: Static order breaks with rotation
+- **maxZ sorting**: Terrain overlaps objects
+- **Newell's algorithm**: Complex, similar results
+- **Layer separation**: Doesn't handle all cases
+
+---
+
+## Coordinate System (Blender Z-up)
+
+For Blender Z-up models, rotation mapping:
+- `rotationY` (Yaw) → Rotate in XY plane (horizontal turntable)
+- `rotationX` (Pitch) → Tilt forward/back
+- `rotationZ` (Roll) → Tilt left/right
+
+```luau
+-- Transform for Z-up model
+local function transformVertex(vx, vy, vz, ...)
+  -- Yaw: rotate in XY plane (around Z)
+  local rx = x * cosY - y * sinY
+  local ry = x * sinY + y * cosY
+  x, y = rx, ry
+  -- Pitch: rotate in YZ plane
+  local ry2 = y * cosX - z * sinX
+  local rz = y * sinX + z * cosX
+  y, z = ry2, rz
+  -- ...
+end
+```
+
+---
+
+## Material Detection (UV-based for Texture Atlases)
+
+When materials use texture atlases (like TEX_envProps), use UV coordinates:
+
+```python
+def get_material_category(mat_name, face, uv_layer):
+    if "terrain" in mat_name.lower():
+        return 1
+    elif "road" in mat_name.lower():
+        return 2
+    elif "prop" in mat_name.lower() or "env" in mat_name.lower():
+        avg_u, avg_v = get_face_uv(face, uv_layer)
+        if avg_u < 0.25 and avg_v > 0.5:
+            return 4  # Rocks (high in atlas)
+        elif avg_u < 0.25:
+            return 6  # Props
+        else:
+            return 5  # Cacti/trees
+    return 1  # Default
+```
+
+---
+
+## Mesh3DUtil - OPTIONAL for Static Models
+
+**For static (non-animated) models, Mesh3DUtil is NOT required.**
+
+Only require it if using:
+- Matrix operations (mat4)
+- Quaternion math
+- Skeletal animation
 
 ---
 
@@ -473,3 +587,67 @@ If Blender MCP is not available, use `blender_to_rive.py`:
 2. Configure MODEL_NAME and settings
 3. Run with Alt+P
 4. Copy generated `.luau` files to Rive
+
+---
+
+## Auto-Rotation Implementation (CRITICAL)
+
+**Problem:** `rotationSpeed` does nothing without waking the render loop.
+
+```luau
+-- ❌ WRONG: Rotation updates but screen doesn't refresh
+local function advance(self: Model3D, seconds: number): boolean
+  self.autoAngleY = self.autoAngleY + self.rotationSpeed * seconds
+  return true
+end
+
+-- ✅ CORRECT: Wake render loop for continuous animation
+export type Model3D = {
+  context: Context?,  -- MUST store context reference
+  -- ...
+}
+
+local function init(self: Model3D, context: Context): boolean
+  self.context = context  -- Store it!
+  return true
+end
+
+local function advance(self: Model3D, seconds: number): boolean
+  if self.rotationSpeed ~= 0 then
+    self.autoAngleY = self.autoAngleY + self.rotationSpeed * seconds
+    if self.context then
+      self.context:markNeedsUpdate()  -- Wake render loop
+    end
+  end
+  return true
+end
+```
+
+---
+
+## Pre-Export Checklist
+
+Before running any export:
+
+- [ ] Analyzed model (vertex count, polygon count, materials)
+- [ ] Identified coordinate system (Z-up for Blender)
+- [ ] Mapped materials to category indices 1-6
+- [ ] Will use `c=index` format (NOT RGB)
+- [ ] Will sort faces by avgZ before fragmenting
+- [ ] Will extract only used vertices per part
+- [ ] Main script will store `context` for `markNeedsUpdate()`
+- [ ] For Z-up: Yaw rotates in XY plane (cosY/sinY on x,y)
+
+---
+
+## Common Mistakes Summary
+
+| What You Did | What Went Wrong | What To Do |
+|--------------|-----------------|------------|
+| Used Mesh3DUtil for static model | Unnecessary import | Inline the math functions |
+| Used RGB `color={r,g,b}` | Files too large | Use `c=1` category index |
+| Sorted by maxZ | Objects behind terrain | Sort by avgZ (centroid) |
+| Forgot `context:markNeedsUpdate()` | rotationSpeed does nothing | Store context, call markNeedsUpdate |
+| Used `table.sort` with comparator | Runtime error | Use manual bubble sort |
+| Yaw rotated around Y axis | Model tilts instead of turns | For Z-up: rotate in XY plane |
+| Shared all vertices across parts | "Code too complex" error | Extract only used vertices per part |
