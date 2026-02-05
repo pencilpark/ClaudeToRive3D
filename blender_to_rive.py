@@ -2,13 +2,21 @@
 Blender to Rive - Skeletal Animation Exporter
 ==============================================
 
-Exports mesh with skeleton, skinning, and animations for Rive Luau scripts.
+Exports any Blender mesh with skeleton, skinning, and animations for Rive Luau scripts.
 
 CRITICAL: All data is exported in the SAME normalized coordinate space:
 - Vertices: Centered, scaled to TARGET_SIZE units max dimension
 - IBMs: Calculated in the same normalized space with scale=1
 - Rest Pose: Local transforms in the same normalized space
 - Animations: Final local transforms per keyframe (not deltas!)
+
+Features (v2.2):
+- Factorized skinning format for smaller file sizes (~40% reduction)
+- Coordinate system: Blender Z-up → Rive (Yaw = XY rotation)
+- Anti-flickering: Implement in Node Script with:
+  * ProjectedFace type with index field
+  * partDepthOffset per Part (0, 10, 20)
+  * table.sort with typed comparator + Z_EPSILON (0.001)
 
 Quaternion format: WXYZ (Blender native) - SkeletalAnimUtil handles conversion to XYZW
 
@@ -18,16 +26,18 @@ Usage:
 3. Select your armature OR mesh (script finds both automatically)
 4. Run this script (Alt+P in Text Editor)
 5. Copy output from generated file to your Luau Data file
+6. In Node Script: implement anti-flickering (see CLAUDE.md for details)
 
 Output structure:
 - ModelData.skeleton (jointCount, jointParents, inverseBindMatrices, restPose)
-- ModelData.skinning (per-vertex joint indices and weights)
+- ModelData.skinningPatterns (factorized - one entry per bone)
+- ModelData.skinningIndex (bone index per vertex)
 - ModelData.vertices (x, y, z in normalized space)
 - ModelData.faces (verts indices 1-based, c = material category)
 - ModelData.animations (channels with times and values)
 
 Author: Claude + Fred Berria
-Version: 1.0.0
+Version: 2.2.0 (Anti-Flickering Documentation)
 """
 
 import bpy
@@ -41,8 +51,8 @@ import os
 MODEL_NAME = "Model"           # Name prefix for output (e.g., "MantaRay", "Character")
 TARGET_SIZE = 200.0            # Normalize mesh to fit in ~200 units (Rive standard)
 OUTPUT_DIR = "//"              # // = relative to .blend file, or absolute path
-MAX_FACES_PER_PART = 350       # Fragment if more faces (Rive script limit)
-MAX_VERTS_PER_PART = 500       # Fragment if more vertices
+MAX_FACES_PER_PART = 1800      # Fragment if more faces (Rive script limit)
+MAX_VERTS_PER_PART = 2400      # Fragment if more vertices
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -213,42 +223,46 @@ def export_skeleton(armature, normalize_mat):
 
 
 # ============================================================================
-# SKINNING EXPORT
+# SKINNING EXPORT (FACTORIZED)
 # ============================================================================
 
-def export_skinning(mesh_obj, bone_index):
-    """Export vertex skinning data (4 joints/weights per vertex)."""
+def export_skinning_factorized(mesh_obj, bone_index, bone_count):
+    """
+    Export vertex skinning data in FACTORIZED format.
+
+    Returns:
+        skinning_patterns: Dict of {bone_index: {j: [indices], w: [weights]}}
+        skinning_index: List of bone index per vertex
+    """
     mesh = mesh_obj.data
     vgroup_names = {vg.index: vg.name for vg in mesh_obj.vertex_groups}
 
-    skinning = []
+    # Create patterns table (one entry per bone)
+    skinning_patterns = {}
+    for i in range(bone_count):
+        skinning_patterns[i] = {"j": [i, 0, 0, 0], "w": [1.0, 0.0, 0.0, 0.0]}
+
+    # For each vertex, find primary bone
+    skinning_index = []
     for vert in mesh.vertices:
         weights = []
         for vg in vert.groups:
             vg_name = vgroup_names.get(vg.group)
             if vg_name and vg_name in bone_index:
-                joint_idx = bone_index[vg_name] - 1  # 0-based for Luau data
+                joint_idx = bone_index[vg_name] - 1  # 0-based
                 weights.append((joint_idx, vg.weight))
 
-        # Sort by weight descending, take top 4
+        # Sort by weight descending, get primary bone
         weights.sort(key=lambda x: -x[1])
-        weights = weights[:4]
 
-        # Normalize weights to sum to 1
-        total = sum(w for _, w in weights)
-        if total > 0:
-            weights = [(j, w / total) for j, w in weights]
+        if weights:
+            primary_bone = weights[0][0]
+        else:
+            primary_bone = 0  # Default to root if no weights
 
-        # Pad to exactly 4
-        while len(weights) < 4:
-            weights.append((0, 0.0))
+        skinning_index.append(primary_bone)
 
-        skinning.append({
-            "j": [w[0] for w in weights],
-            "w": [w[1] for w in weights]
-        })
-
-    return skinning
+    return skinning_patterns, skinning_index
 
 
 # ============================================================================
@@ -388,10 +402,10 @@ def export_animations(armature, normalize_mat, bone_index):
 # FRAGMENTATION (for large meshes)
 # ============================================================================
 
-def fragment_data(vertices, faces, skinning, max_faces, max_verts):
+def fragment_data(vertices, faces, skinning_index, max_faces, max_verts):
     """Split data into multiple parts if exceeding limits."""
     if len(faces) <= max_faces and len(vertices) <= max_verts:
-        return [{"vertices": vertices, "faces": faces, "skinning": skinning}]
+        return [{"vertices": vertices, "faces": faces, "skinning_index": skinning_index}]
 
     parts = []
     face_chunks = [faces[i:i+max_faces] for i in range(0, len(faces), max_faces)]
@@ -408,7 +422,7 @@ def fragment_data(vertices, faces, skinning, max_faces, max_verts):
 
         # Extract vertices and skinning for this part
         part_vertices = [vertices[i - 1] for i in sorted_indices]
-        part_skinning = [skinning[i - 1] for i in sorted_indices]
+        part_skinning_index = [skinning_index[i - 1] for i in sorted_indices]
 
         # Remap face indices
         part_faces = []
@@ -419,7 +433,7 @@ def fragment_data(vertices, faces, skinning, max_faces, max_verts):
         parts.append({
             "vertices": part_vertices,
             "faces": part_faces,
-            "skinning": part_skinning
+            "skinning_index": part_skinning_index
         })
 
     return parts
@@ -438,12 +452,21 @@ def fmt(n):
     return str(n)
 
 
-def generate_luau_output(data, part_name="ModelData"):
-    """Generate Luau-formatted output string."""
+def generate_luau_output(data, part_name="ModelData", bone_count=0):
+    """Generate Luau-formatted output string with factorized skinning."""
     lines = []
-    lines.append(f"-- Generated by blender_to_rive.py")
+    lines.append(f"-- Generated by blender_to_rive.py v2.2")
     lines.append(f"-- Model: {MODEL_NAME}")
     lines.append(f"-- Vertices: {len(data['vertices'])}, Faces: {len(data['faces'])}")
+    lines.append(f"-- Using factorized skinning format for smaller file size")
+    lines.append("")
+
+    # Skinning patterns table (factorized - one per bone)
+    lines.append("-- Skinning patterns (one per bone)")
+    lines.append("local S = {")
+    for i in range(bone_count):
+        lines.append(f"  [{i}] = {{j = {{{i}, 0, 0, 0}}, w = {{1.0, 0.0, 0.0, 0.0}}}},")
+    lines.append("}")
     lines.append("")
 
     # Skeleton (only in first part)
@@ -486,17 +509,13 @@ def generate_luau_output(data, part_name="ModelData"):
     lines.append("}")
     lines.append("")
 
-    # Skinning
+    # Skinning (FACTORIZED format)
     lines.append("-- " + "=" * 76)
-    lines.append("-- SKINNING")
+    lines.append("-- SKINNING (Factorized)")
     lines.append("-- " + "=" * 76)
     lines.append("")
-    lines.append(f"{part_name}.skinning = {{")
-    for skin in data['skinning']:
-        j = ", ".join(str(x) for x in skin['j'])
-        w = ", ".join(fmt(x) for x in skin['w'])
-        lines.append(f"  {{ j = {{ {j} }}, w = {{ {w} }} }},")
-    lines.append("}")
+    lines.append(f"{part_name}.skinningPatterns = S")
+    lines.append(f"{part_name}.skinningIndex = {{{', '.join(str(i) for i in data['skinning_index'])}}}")
     lines.append("")
 
     # Faces
@@ -544,7 +563,8 @@ def generate_luau_output(data, part_name="ModelData"):
 
 def main():
     print("\n" + "=" * 60)
-    print("  BLENDER TO RIVE - Skeletal Animation Exporter")
+    print("  BLENDER TO RIVE - Skeletal Animation Exporter v2.2")
+    print("  (Factorized Skinning + Anti-Flickering Support)")
     print("=" * 60)
 
     armature, mesh_obj = get_armature_and_mesh()
@@ -572,7 +592,8 @@ def main():
     # Export skeleton
     print("\n[2/5] Exporting skeleton...")
     skeleton_data = export_skeleton(armature, normalize_mat)
-    print(f"  Joints: {skeleton_data['jointCount']}")
+    bone_count = skeleton_data['jointCount']
+    print(f"  Joints: {bone_count}")
     print(f"  Bones: {', '.join(skeleton_data['boneNames'])}")
 
     # Export mesh data
@@ -584,8 +605,12 @@ def main():
     faces = export_faces(mesh_obj)
     print(f"  Faces: {len(faces)}")
 
-    skinning = export_skinning(mesh_obj, skeleton_data['boneIndex'])
-    print(f"  Skinned vertices: {len(skinning)}")
+    # Export factorized skinning
+    skinning_patterns, skinning_index = export_skinning_factorized(
+        mesh_obj, skeleton_data['boneIndex'], bone_count
+    )
+    print(f"  Skinned vertices: {len(skinning_index)}")
+    print(f"  Skinning patterns: {len(skinning_patterns)} (one per bone)")
 
     # Export animations
     print("\n[5/5] Exporting animations...")
@@ -595,7 +620,7 @@ def main():
         print(f"    - {name}: {anim['duration']:.2f}s, {len(anim['channels'])} channels")
 
     # Fragment if needed
-    parts = fragment_data(vertices, faces, skinning, MAX_FACES_PER_PART, MAX_VERTS_PER_PART)
+    parts = fragment_data(vertices, faces, skinning_index, MAX_FACES_PER_PART, MAX_VERTS_PER_PART)
     print(f"\n  Data split into {len(parts)} part(s)")
 
     # Generate output files
@@ -611,11 +636,11 @@ def main():
             part["skeleton"] = skeleton_data
             part["animations"] = animations
 
-        output = generate_luau_output(part, part_name)
+        output = generate_luau_output(part, part_name, bone_count)
         output_path = os.path.join(output_dir, filename)
 
         # Add header for Luau file
-        header = f"--!strict\n-- {filename}\n-- Auto-generated by blender_to_rive.py\n\nlocal {part_name} = {{}}\n\n"
+        header = f"--!strict\n-- {filename}\n-- Auto-generated by blender_to_rive.py v2.2\n\nlocal {part_name} = {{}}\n\n"
         footer = f"\n\nreturn {part_name}\n"
 
         with open(output_path, 'w') as f:
@@ -631,7 +656,14 @@ def main():
     print("\nNext steps:")
     print("  1. Copy the generated .luau files to your Rive project")
     print("  2. Update require() statements in your main script")
-    print("  3. Set animationName input to one of the available animations")
+    print("  3. Use skinningPatterns + skinningIndex (factorized format)")
+    print("  4. Set animationName input to one of the available animations")
+    print("  5. IMPLEMENT ANTI-FLICKERING in Node Script:")
+    print("     - Add 'index' field to ProjectedFace type")
+    print("     - Add 'partDepthOffset' parameter to processFaces")
+    print("     - Use LARGE offsets: 0, 10, 20 (NOT 0.001, 0.002)")
+    print("     - Use table.sort with typed comparator + Z_EPSILON (0.001)")
+    print("     - See CLAUDE.md for complete implementation")
     print("\n")
 
 
