@@ -15,8 +15,9 @@
 5. **BLENDER Z-UP**: Yaw = XY rotation, NOT Y-axis rotation
 6. **FACTORIZE SKINNING** - Use patterns table + index array (~40% smaller files)
 7. **USE ANTI-FLICKERING METHOD** - table.sort + index tiebreaker + Z_EPSILON (0.001)
-8. **USE partDepthOffset** - LARGE values (0, 10, 20) per Part file to prevent z-fighting
+8. **USE `depthBias`** - On processFaces: 0/10/20 for object-based parts, 0 for Z-sliced parts, 99/100 for wall overlays
 9. **ProjectedFace needs `index` field** - For stable sort tiebreaker
+10. **WALL-MOUNTED SURFACES** - Remove from Blender, hardcode in Node Script, use depthBias=100
 
 ---
 
@@ -28,7 +29,8 @@ Convert Blender 3D models into functional Rive Node Script Luau code with:
 - Material-to-color category conversion
 - Vertex index optimization per fragment
 - **Factorized skinning data** (patterns + index array)
-- **Anti-flickering system**: table.sort + index tiebreaker + partDepthOffset
+- **Anti-flickering system**: table.sort + index tiebreaker + depthBias
+- **Wall-mounted surfaces**: hardcoded in Node Script + depthBias for guaranteed draw order
 
 ---
 
@@ -79,18 +81,19 @@ export type ProjectedFace = {
 }
 ```
 
-#### 2. partDepthOffset per Part File
+#### 2. depthBias on processFaces
 ```luau
--- Add partDepthOffset parameter to processFaces function
+-- Add optional depthBias parameter to processFaces
 local function processFaces(
     self: Model3D,
     vertices: { { x: number, y: number, z: number } },
     faces: { { verts: { number }, c: number } },
     -- ... other parameters ...
-    partDepthOffset: number  -- Unique offset per Part to prevent z-fighting
+    depthBias: number?  -- Shifts depth for sort order without moving geometry
 )
-    -- Apply offset when calculating depth:
-    local avgZ = (sumZ / #transformed) + partDepthOffset
+    local bias = depthBias or 0
+    -- Apply bias when calculating depth:
+    local avgZ = (sumZ / #transformed) + bias
 
     -- Insert with index for stable sorting:
     table.insert(self.projectedFaces, {
@@ -100,11 +103,23 @@ local function processFaces(
         index = #self.projectedFaces + 1,  -- Stable sort index
     })
 end
+```
 
--- Call with LARGE offsets (NOT 0.001, 0.002):
+**Usage depends on how parts are split:**
+
+```luau
+-- Case A: Parts = separate objects (robot body/head) → large bias
 processFaces(self, vertsA, facesA, ..., 0)   -- Part A: reference
 processFaces(self, vertsB, facesB, ..., 10)  -- Part B: offset 10
 processFaces(self, vertsC, facesC, ..., 20)  -- Part C: offset 20
+
+-- Case B: Parts = Z-sorted slices of mixed objects (room) → no bias
+processFaces(self, vertsA, facesA, ...)       -- Part A: bias=0 (default)
+processFaces(self, vertsB, facesB, ...)       -- Part B: bias=0
+
+-- Case C: Wall-mounted overlay (screen, panel) → force to front
+processFaces(self, borderVerts, borderFaces, ..., 99)   -- Border behind
+processFaces(self, screenVerts, screenFaces, ..., 100)   -- Screen on top
 ```
 
 #### 3. Stable Sort with table.sort
@@ -125,17 +140,48 @@ end)
 ```
 
 ### Recommended Values (Tested)
-| Parameter | Value | Effect |
-|-----------|-------|--------|
-| Z_EPSILON | 0.001 | Threshold for index tiebreaker |
-| partDepthOffset A | 0 | Part A: reference |
-| partDepthOffset B | 10 | Part B: clear separation |
-| partDepthOffset C | 20 | Part C: clear separation |
-| faceExpansion | 0.1 | Visual gap between faces |
-| brightness | 50 | Base lighting (%) |
+| Parameter | Value | When |
+|-----------|-------|------|
+| Z_EPSILON | 0.001 | Always |
+| depthBias (separate objects) | 0, 10, 20 | Parts = distinct mesh objects |
+| depthBias (Z-sliced parts) | 0 for all | Parts = mixed objects sorted by avgZ |
+| depthBias (wall overlay) | 99, 100 | Surfaces that must draw on top of wall |
+| faceExpansion | 0.05 | Always |
+| brightness | 50 | Always |
 
-### Why Large Offsets?
-Small offsets (0.001, 0.002) don't reliably separate Parts during rotation. Large offsets (10, 20) ensure Parts never compete for the same depth range.
+### Key Insight: depthBias decouples position from sort order
+Moving geometry further from a wall to avoid Z-fighting causes visible "detachment" during rotation. Instead, keep geometry close (1-2 normalized units) and use a large depthBias to force sort order. The bias only affects the painter's algorithm depth sort, not the visual position of the polygons.
+
+---
+
+## Wall-Mounted Surfaces (Screens, Panels, Signs)
+
+**Problem:** Flat surfaces on walls Z-fight at rotation angles. Geometric offsets either fail (too small) or cause visible detachment (too large).
+
+**Solution:**
+1. Remove the surface mesh from Blender
+2. Re-export Part files without it
+3. Hardcode vertices/faces directly in the Node Script (`advance()`)
+4. Position close to wall (1-2 normalized units from wall surface)
+5. Use `depthBias=99/100` to force draw order
+
+```luau
+-- Hardcoded TV screen in advance() — positioned flush with wall
+local screenVerts: { { x: number, y: number, z: number } } = {
+    {x=-51, y=48.66, z=-8.82},   -- 4 corners of the rectangle
+    {x=-51, y=83.91, z=-8.82},
+    {x=-51, y=83.91, z=17.61},
+    {x=-51, y=48.66, z=17.61},
+}
+local screenFaces: { { verts: { number }, c: number } } = {
+    {verts = {1, 2, 3}, c = 12},  -- 2 tris = 1 quad
+    {verts = {1, 3, 4}, c = 12},
+}
+-- depthBias=100 → always draws on top of wall, any angle
+processFaces(self, screenVerts, screenFaces, ..., 100)
+```
+
+**Why this works:** depthBias adds to the depth sort value, not to the visual position. The screen looks flush with the wall but always sorts in front. No rotation angle can overcome a +100 depth advantage when wall faces have real depths in the [-100, +100] range.
 
 ---
 
@@ -239,11 +285,11 @@ local function transformVertex(vx, vy, vz, ax, ay, az, cosX, sinX, cosY, sinY, c
     local rz = y * sinX + z * cosX
     y, z = ry2, rz
 
-    -- Roll: rotate in XZ plane (tilt left/right)
-    local rx2 = x * cosZ + z * sinZ
-    local rz2 = -x * sinZ + z * cosZ
+    -- Roll: rotate in XY plane (screen-space tilt around camera Z axis)
+    local rx2 = x * cosZ - y * sinZ
+    local ry2b = x * sinZ + y * cosZ
 
-    return rx2, y, rz2
+    return rx2, ry2b, z
 end
 ```
 
@@ -343,8 +389,10 @@ return ModelData
 | Problem | Cause | Solution |
 |---------|-------|----------|
 | Faces flickering | Z-fighting from coplanar faces | Use 3-technique anti-flickering |
-| Flickering between Parts | Parts compete for same depth | Use LARGE partDepthOffset (10, 20) |
-| Small offsets don't work | 0.001, 0.002 too close | Use 0, 10, 20 for partDepthOffset |
+| Flickering between Parts (objects) | Parts compete for same depth | Use depthBias 0, 10, 20 |
+| Flickering between Parts (Z-sliced) | Bias corrupts mixed Z-ordering | Use depthBias=0 for all parts |
+| Screen/panel flickers on wall | Coplanar with wall | Hardcode + depthBias=100 (see Wall-Mounted Surfaces) |
+| Screen detaches from wall during rotation | Geometric offset too large | Use small offset + large depthBias instead |
 | Model twisted when animated | Coordinate space mismatch | Use SAME normalize_mat for ALL data |
 | Animation explodes | Armature scale ≠ 1 | Force scale=1 on bone matrices |
 | Animation doesn't play | Wrong animation name | Check console for available names |
@@ -370,10 +418,14 @@ Before running any export:
 - [ ] For Z-up: Yaw rotates in XY plane (cosY/sinY on x,y)
 - [ ] **Anti-flickering implemented:**
   - [ ] ProjectedFace type has `index` field
-  - [ ] processFaces has `partDepthOffset` parameter
-  - [ ] partDepthOffset values: 0, 10, 20 (LARGE, not 0.001)
+  - [ ] processFaces has optional `depthBias` parameter
+  - [ ] depthBias: 0 for Z-sliced parts, 0/10/20 for object-based parts
   - [ ] table.sort with typed comparator + Z_EPSILON (0.001) + index tiebreaker
-  - [ ] faceExpansion = 0.1, brightness = 50
+  - [ ] faceExpansion = 0.05, brightness = 50
+- [ ] **Wall-mounted surfaces** (if model has screens, panels, signs):
+  - [ ] Removed from Blender, hardcoded in Node Script
+  - [ ] Positioned close to wall (1-2 normalized units)
+  - [ ] depthBias=99/100 to force draw order
 
 ---
 
@@ -389,7 +441,8 @@ Before running any export:
 | Used untyped table.sort comparator | May not work | Use TYPED comparator (`: ProjectedFace, : boolean`) |
 | Yaw rotated around Y axis | Model tilts instead of turns | For Z-up: rotate in XY plane |
 | Shared all vertices across parts | "Code too complex" error | Extract only used vertices per part |
-| Used small partDepthOffset (0.001) | Still flickering | Use LARGE offsets (10, 20) |
+| Used geometric offset for wall screen | Screen detaches at rotation | Use depthBias=100 + small geometric offset |
+| Used depthBias on Z-sliced parts | Objects appear behind walls | Use depthBias=0 for Z-sliced parts |
 | No index field in ProjectedFace | Unstable sort order | Add `index` field for tiebreaker |
 
 ---

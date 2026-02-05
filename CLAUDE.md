@@ -10,8 +10,9 @@
 4. **Extract only used vertices per part** - Prevents typecheck errors
 5. **Blender Z-up**: Yaw rotates in XY plane, NOT around Y axis
 6. **Factorize skinning data** - Use index references to reduce file size by ~40%
-7. **Use anti-flickering method** - table.sort + index tiebreaker + partDepthOffset
-8. **Use partDepthOffset per Part file** - Large offsets (0, 10, 20) to prevent z-fighting between Parts
+7. **Use anti-flickering method** - table.sort + index tiebreaker + depthBias
+8. **Use depthBias per Part file** - Large offsets (0, 10, 20) when parts are separate objects
+9. **Wall-mounted surfaces (screens, panels)** - Hardcode in Node Script + depthBias to force draw order
 
 ## Project Structure (Generic Template)
 
@@ -93,19 +94,20 @@ export type ProjectedFace = {
 }
 ```
 
-#### 4.2 partDepthOffset per Part File
+#### 4.2 depthBias Parameter on processFaces
 ```luau
--- Add partDepthOffset parameter to processFaces function
+-- Add optional depthBias parameter to processFaces function
 local function processFaces(
     self: Model3D,
     vertices: { { x: number, y: number, z: number } },
     faces: { { verts: { number }, c: number } },
     -- ... other parameters ...
-    partDepthOffset: number  -- Unique offset per Part to prevent z-fighting between files
+    depthBias: number?  -- Optional: shifts depth for sort order without moving geometry
 )
+    local bias = depthBias or 0
     -- ...
-    -- Apply offset when calculating depth:
-    local avgZ = (sumZ / #transformed) + partDepthOffset
+    -- Apply bias when calculating depth:
+    local avgZ = (sumZ / #transformed) + bias
     -- ...
     -- Insert with index for stable sorting:
     table.insert(self.projectedFaces, {
@@ -115,12 +117,27 @@ local function processFaces(
         index = #self.projectedFaces + 1,  -- Stable sort index
     })
 end
+```
 
--- Call with LARGE offsets (10, 20 NOT 0.001, 0.002):
+**depthBias has two distinct use cases:**
+
+**Case A — Parts represent separate objects** (e.g., robot body / robot head):
+```luau
+-- Each part has non-overlapping geometry → use large bias to separate
 processFaces(self, vertsA, facesA, ..., 0)   -- Part A: reference
 processFaces(self, vertsB, facesB, ..., 10)  -- Part B: offset 10
 processFaces(self, vertsC, facesC, ..., 20)  -- Part C: offset 20
 ```
+
+**Case B — Parts are Z-sorted slices of mixed objects** (e.g., room with walls, bed, ceiling all sliced together):
+```luau
+-- Parts overlap in Z range → bias=0 to preserve true Z-ordering
+processFaces(self, vertsA, facesA, ..., 0)   -- Part A: no bias
+processFaces(self, vertsB, facesB, ..., 0)   -- Part B: no bias
+processFaces(self, vertsC, facesC, ..., 0)   -- Part C: no bias
+```
+
+**How to decide:** If Part files are split by sorting ALL faces by avgZ and taking slices → use bias=0. If Part files correspond to distinct mesh objects → use large bias (10, 20).
 
 #### 4.3 Stable Sort with table.sort and Index Tiebreaker
 ```luau
@@ -143,14 +160,11 @@ end)
 | Parameter | Value | Effect |
 |-----------|-------|--------|
 | Z_EPSILON | 0.001 | Threshold for index tiebreaker |
-| partDepthOffset A | 0 | Part A: reference (no offset) |
-| partDepthOffset B | 10 | Part B: clear separation from A |
-| partDepthOffset C | 20 | Part C: clear separation from A and B |
-| faceExpansion | 0.1 | Visual gap between faces |
+| depthBias (separate objects) | 0, 10, 20 | Large separation between distinct parts |
+| depthBias (Z-sliced parts) | 0, 0, 0 | No bias — preserves true Z-ordering |
+| depthBias (wall overlays) | 99, 100 | Forces overlay to always draw on top |
+| faceExpansion | 0.05 | Visual gap between faces |
 | brightness | 50 | Base lighting level (%) |
-
-**Why Large Offsets (10, 20)?**
-Small offsets (0.001, 0.002) don't reliably separate Parts during rotation. Large offsets ensure Parts from different files never compete for the same depth range.
 
 ### 5. Coordinate System (Blender Z-up to Rive)
 **Blender uses Z-up, Rive screen is X-right, Y-down, Z-into-screen.**
@@ -171,10 +185,10 @@ local function transformVertex(vx, vy, vz, ...)
   local ry2 = y * cosX - z * sinX
   local rz = y * sinX + z * cosX
   y, z = ry2, rz
-  -- Roll: rotate in XZ plane (tilt left/right)
-  local rx2 = x * cosZ + z * sinZ
-  local rz2 = -x * sinZ + z * cosZ
-  return rx2, y, rz2
+  -- Roll: rotate in XY plane (screen-space tilt around camera Z axis)
+  local rx2 = x * cosZ - y * sinZ
+  local ry2b = x * sinZ + y * cosZ
+  return rx2, ry2b, z
 end
 ```
 
@@ -185,6 +199,50 @@ Only require Mesh3DUtil if using:
 - Matrix operations (mat4)
 - Quaternion math
 - Skeletal animation
+
+### 7. Wall-Mounted Surfaces (Screens, Panels, Signs)
+
+**Problem:** Flat surfaces on walls (TV screens, info panels, signs) cause Z-fighting with the wall behind them, regardless of geometric offset. Small offsets fail at rotation angles because projected Z-difference shrinks. Large offsets cause the surface to visually "detach" from the wall during rotation.
+
+**Solution: Decouple visual position from sort order using `depthBias`.**
+
+1. **Remove the surface from Blender** (delete the mesh)
+2. **Re-export Part files** (without the surface)
+3. **Hardcode the surface as vertices/faces directly in the Node Script** (`advance()`)
+4. **Position close to wall** (1-2 normalized units offset — visually flush)
+5. **Use large `depthBias`** (99-100) to force it to always draw IN FRONT of everything
+
+```luau
+-- Example: TV Screen hardcoded in Node Script
+-- Wall at x≈-52.5. Screen at x=-51 (visually flush, 1.5 units from wall).
+-- depthBias=100 forces screen to sort AFTER all wall faces at any angle.
+local tvScreenVerts: { { x: number, y: number, z: number } } = {
+    {x=-51, y=48.66, z=-8.82},
+    {x=-51, y=83.91, z=-8.82},
+    {x=-51, y=83.91, z=17.61},
+    {x=-51, y=48.66, z=17.61},
+}
+local tvScreenFaces: { { verts: { number }, c: number } } = {
+    {verts = {1, 2, 3}, c = 12},  -- 2 triangles = 1 rectangle
+    {verts = {1, 3, 4}, c = 12},
+}
+-- Process with depthBias=100 (drawn last = in front)
+processFaces(self, tvScreenVerts, tvScreenFaces, ..., 100)
+```
+
+**Why this works:** `depthBias` adds +100 to the depth used for sorting, but does NOT move the geometry. The screen is visually at x=-51 (flush with wall) but sorts as if it were 100 units closer to camera. No rotation angle can overcome a 100-unit depth advantage.
+
+**When to use:** Any surface that must always render on top of the surface behind it, at all rotation angles. Typical examples:
+- TV screens on walls
+- Emissive borders/bezels around screens
+- Wall-mounted info panels or signs
+- Decals that must never flicker with the wall
+
+**Layering multiple overlays:** Use incrementing bias values to control stacking order:
+```luau
+processFaces(self, borderVerts, borderFaces, ..., 99)   -- Border: behind screen
+processFaces(self, screenVerts, screenFaces, ..., 100)   -- Screen: on top
+```
 
 ---
 
@@ -242,8 +300,11 @@ skinning_index = [skin["j"][0] for skin in all_skinning]
 
 | Issue | Cause | Solution |
 |-------|-------|----------|
-| Faces flickering | Z-fighting from coplanar faces | Use 3-technique anti-flickering: index + partDepthOffset + table.sort |
-| Flickering between Parts | Parts from different files compete | Use LARGE partDepthOffset (10, 20) NOT small values |
+| Faces flickering | Z-fighting from coplanar faces | Use 3-technique anti-flickering: index + depthBias + table.sort |
+| Flickering between Parts (separate objects) | Parts from different files compete | Use LARGE depthBias (10, 20) per part |
+| Flickering between Parts (Z-sliced) | Parts overlap in Z range | Use depthBias=0 for all parts |
+| Screen/panel flickers on wall | Coplanar surface competes with wall | Hardcode in Node Script + depthBias=100 (see section 7) |
+| Screen "detaches" from wall | Geometric offset too large | Use small geometric offset + large depthBias instead |
 | Objects behind terrain | Wrong depth sort direction | Use `depth < depth` for back-to-front |
 | Model rotates wrong axis | Y-up vs Z-up confusion | Yaw rotates in XY plane for Z-up models |
 | Faces disappear | Wrong backface culling | Check normal direction `nz < 0` |
@@ -251,7 +312,6 @@ skinning_index = [skin["j"][0] for skin in all_skinning]
 | File too large / typecheck error | Too many repeated skinning entries | Use factorized skinning format |
 | Rotation doesn't work | rotationSpeed on wrong axis | Apply to Yaw (XY rotation) |
 | Animation doesn't update | Missing markNeedsUpdate | Store context, call `context:markNeedsUpdate()` |
-| Small offsets don't work | 0.001, 0.002 too close during rotation | Use 0, 10, 20 for partDepthOffset |
 
 ---
 
@@ -342,10 +402,14 @@ self.skinnedVerts = skinVertices(skeleton, vertices, skinPatterns, skinIndex)
 - [ ] For Z-up: Yaw rotates in XY plane (cosY/sinY on x,y)
 - [ ] **Anti-flickering implemented:**
   - [ ] ProjectedFace type has `index` field
-  - [ ] processFaces has `partDepthOffset` parameter
-  - [ ] partDepthOffset values: 0, 10, 20 (LARGE, not 0.001)
+  - [ ] processFaces has optional `depthBias` parameter
+  - [ ] depthBias: 0 for Z-sliced parts, 0/10/20 for object-based parts
   - [ ] table.sort with typed comparator + Z_EPSILON (0.001) + index tiebreaker
-  - [ ] faceExpansion = 0.1, brightness = 50
+  - [ ] faceExpansion = 0.05, brightness = 50
+- [ ] **Wall-mounted surfaces** (if any screens, panels, signs):
+  - [ ] Removed from Blender, hardcoded in Node Script
+  - [ ] Positioned close to wall (1-2 normalized units)
+  - [ ] depthBias=99/100 to force draw order
 
 ---
 
@@ -357,7 +421,8 @@ self.skinnedVerts = skinVertices(skeleton, vertices, skinPatterns, skinIndex)
 - Paths created in `advance()`, only drawn in `draw()`
 - Factorized skinning has minimal runtime overhead (one table lookup per vertex)
 - Index tiebreaker ensures stable sort order between frames
-- Large partDepthOffset prevents inter-part z-fighting completely
+- depthBias on processFaces decouples visual position from sort order (zero runtime cost)
+- Wall-mounted overlays with depthBias=100 never flicker regardless of rotation angle
 
 ---
 
@@ -367,6 +432,32 @@ self.skinnedVerts = skinVertices(skeleton, vertices, skinPatterns, skinIndex)
 -- Recommended defaults for new 3D models
 rotationSpeed = 10,       -- Visible rotation for testing
 brightness = 50,          -- Base lighting 50%
-faceExpansion = 0.1,      -- Visual gap between faces
+faceExpansion = 0.05,     -- Visual gap between faces
 backfaceCulling = true,   -- Cull back-facing polygons
 ```
+
+## Workflow Orchestration
+
+### 1. Plan Mode Default
+Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)If something goes sideways, STOP and re-plan immediately - don't keep pushingUse plan mode for verification steps, not just buildingWrite detailed specs upfront to reduce ambiguity
+
+### 2. Subagent Strategy to keep main context window clean
+Offload research, exploration, and parallel analysis to subagentsFor complex problems, throw more compute at it via subagentsOne task per subagent for focused execution
+
+### 3. Self-Improvement Loop
+After ANY correction from the user: update 'tasks/lessons.md' with the patternWrite rules for yourself that prevent the same mistakeRuthlessly iterate on these lessons until mistake rate dropsReview lessons at session start for relevant project
+
+### 4. Verification Before Done
+Never mark a task complete without proving it worksDiff behavior between main and your changes when relevantAsk yourself: "Would a staff engineer approve this?"Run tests, check logs, demonstrate correctness
+
+### 5. Demand Elegance (Balanced)
+For non-trivial changes: pause and ask "is there a more elegant way?"If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"Skip this for simple, obvious fixes - don't over-engineerChallenge your own work before presenting it
+
+### 6. Autonomous Bug Fixing
+When given a bug report: just fix it. Don't ask for hand-holdingPoint at logs, errors, failing tests -> then resolve themZero context switching required from the userGo fix failing CI tests without being told how
+
+## Task Management
+**Plan First**: Write plan to 'tasks/todo.md' with checkable items**Verify Plan**: Check in before starting implementation**Track Progress**: Mark items complete as you go**Explain Changes**: High-level summary at each step**Document Results**: Add review to 'tasks/todo.md'**Capture Lessons**: Update 'tasks/lessons.md' after corrections
+
+## Core Principles
+**Simplicity First**: Make every change as simple as possible. Impact minimal code.**No Laziness**: Find root causes. No temporary fixes. Senior developer standards.**Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
