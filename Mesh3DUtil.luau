@@ -249,6 +249,58 @@ function Mesh3DUtil.quatSlerp(a: Quat, b: Quat, t: number): Quat
   return { s0 * a[1] + s1 * bx, s0 * a[2] + s1 * by, s0 * a[3] + s1 * bz, s0 * a[4] + s1 * bw }
 end
 
+-- Decompose a 4x4 matrix into translation, rotation (XYZW quat), scale
+function Mesh3DUtil.mat4Decompose(m: Mat4): (Vec3, Quat, Vec3)
+  -- Translation from column 3
+  local tx, ty, tz = m[13], m[14], m[15]
+
+  -- Scale = length of each column
+  local sx = math.sqrt(m[1] * m[1] + m[2] * m[2] + m[3] * m[3])
+  local sy = math.sqrt(m[5] * m[5] + m[6] * m[6] + m[7] * m[7])
+  local sz = math.sqrt(m[9] * m[9] + m[10] * m[10] + m[11] * m[11])
+
+  -- Avoid division by zero
+  local isx = sx > 0.00001 and 1 / sx or 0
+  local isy = sy > 0.00001 and 1 / sy or 0
+  local isz = sz > 0.00001 and 1 / sz or 0
+
+  -- Normalized rotation matrix
+  local r11, r21, r31 = m[1] * isx, m[2] * isx, m[3] * isx
+  local r12, r22, r32 = m[5] * isy, m[6] * isy, m[7] * isy
+  local r13, r23, r33 = m[9] * isz, m[10] * isz, m[11] * isz
+
+  -- Quaternion from rotation matrix (Shepperd's method)
+  local trace = r11 + r22 + r33
+  local qx, qy, qz, qw
+  if trace > 0 then
+    local s = math.sqrt(trace + 1) * 2
+    qw = 0.25 * s
+    qx = (r23 - r32) / s
+    qy = (r31 - r13) / s
+    qz = (r12 - r21) / s
+  elseif r11 > r22 and r11 > r33 then
+    local s = math.sqrt(1 + r11 - r22 - r33) * 2
+    qw = (r23 - r32) / s
+    qx = 0.25 * s
+    qy = (r21 + r12) / s
+    qz = (r31 + r13) / s
+  elseif r22 > r33 then
+    local s = math.sqrt(1 + r22 - r11 - r33) * 2
+    qw = (r31 - r13) / s
+    qx = (r21 + r12) / s
+    qy = 0.25 * s
+    qz = (r32 + r23) / s
+  else
+    local s = math.sqrt(1 + r33 - r11 - r22) * 2
+    qw = (r12 - r21) / s
+    qx = (r31 + r13) / s
+    qy = (r32 + r23) / s
+    qz = 0.25 * s
+  end
+
+  return { tx, ty, tz }, { qx, qy, qz, qw }, { sx, sy, sz }
+end
+
 -- ============================================================================
 -- Vector Math
 -- ============================================================================

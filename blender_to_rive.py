@@ -7,37 +7,45 @@ Exports any Blender mesh with skeleton, skinning, and animations for Rive Luau s
 CRITICAL: All data is exported in the SAME normalized coordinate space:
 - Vertices: Centered, scaled to TARGET_SIZE units max dimension
 - IBMs: Calculated in the same normalized space with scale=1
-- Rest Pose: Local transforms in the same normalized space
-- Animations: Final local transforms per keyframe (not deltas!)
+- Rest Pose: Local transforms in the same normalized space, scale always {1,1,1}
+- Animations: ABSOLUTE local transforms per keyframe (NOT deltas!)
 
-Features (v2.2):
+Data format conventions:
+- Quaternions: WXYZ (Blender native) — SkeletalAnimUtil converts to XYZW internally
+- Joint indices: 1-based (Luau array convention)
+- Skinning patterns: 0-based bone indices (runtime adds +1)
+- Ordered arrays only (no named keys like {x=,y=,z=})
+
+Features (v3.0):
 - Factorized skinning format for smaller file sizes (~40% reduction)
+- Multi-zone coloring: one material per zone → category index c=1..N
+- Separate animation files to avoid exceeding Rive script size limits
 - Coordinate system: Blender Z-up → Rive (Yaw = XY rotation)
-- Anti-flickering: Implement in Node Script with:
-  * ProjectedFace type with index field
-  * partDepthOffset per Part (0, 10, 20)
-  * table.sort with typed comparator + Z_EPSILON (0.001)
-
-Quaternion format: WXYZ (Blender native) - SkeletalAnimUtil handles conversion to XYZW
+- Anti-flickering: Implement in Node Script (see CLAUDE.md)
 
 Usage:
 1. Open your .blend file with rigged mesh
 2. Configure MODEL_NAME and other settings below
-3. Select your armature OR mesh (script finds both automatically)
-4. Run this script (Alt+P in Text Editor)
-5. Copy output from generated file to your Luau Data file
-6. In Node Script: implement anti-flickering (see CLAUDE.md for details)
+3. Assign materials for multi-zone coloring (one material per body zone)
+4. Select your armature OR mesh (script finds both automatically)
+5. Run this script (Alt+P in Text Editor)
+6. Copy generated .luau files to your Rive project
+7. In Node Script: use colorMap for multi-zone colors, implement anti-flickering
 
 Output structure:
-- ModelData.skeleton (jointCount, jointParents, inverseBindMatrices, restPose)
-- ModelData.skinningPatterns (factorized - one entry per bone)
-- ModelData.skinningIndex (bone index per vertex)
-- ModelData.vertices (x, y, z in normalized space)
-- ModelData.faces (verts indices 1-based, c = material category)
-- ModelData.animations (channels with times and values)
+- Part files (ModelPartAData.luau, etc.):
+  * ModelData.skeleton (jointCount, jointParents, inverseBindMatrices, restPose)
+  * ModelData.skinningPatterns (factorized - one entry per bone, 0-based indices)
+  * ModelData.skinningIndex (bone index per vertex)
+  * ModelData.vertices (x, y, z in normalized space)
+  * ModelData.faces (verts indices 1-based, c = material category 1..N)
+
+- Animation files (ModelAnim1Data.luau, etc.):
+  * ModelData.animations (channels with ABSOLUTE local transforms)
+  * jointIndex is 1-based, rotation values are WXYZ
 
 Author: Claude + Fred Berria
-Version: 2.2.0 (Anti-Flickering Documentation)
+Version: 3.0.0 (Absolute Transforms + Multi-Zone Coloring)
 """
 
 import bpy
@@ -48,11 +56,17 @@ import os
 # CONFIGURATION - EDIT THESE VALUES
 # ============================================================================
 
-MODEL_NAME = "Model"           # Name prefix for output (e.g., "MantaRay", "Character")
+MODEL_NAME = "Model"           # Name prefix for output (e.g., "Viper", "MantaRay", "Character")
+                               # Output files: ModelPartAData.luau, ModelAnim1Data.luau, etc.
 TARGET_SIZE = 200.0            # Normalize mesh to fit in ~200 units (Rive standard)
 OUTPUT_DIR = "//"              # // = relative to .blend file, or absolute path
-MAX_FACES_PER_PART = 1800      # Fragment if more faces (Rive script limit)
-MAX_VERTS_PER_PART = 2400      # Fragment if more vertices
+MAX_FACES_PER_PART = 1800      # Fragment if more faces (Rive script limit ~1900)
+MAX_VERTS_PER_PART = 2400      # Fragment if more vertices (Rive script limit ~2500)
+
+# Multi-zone coloring:
+# Assign Blender materials to face zones BEFORE running this script.
+# Each material becomes a category index c=1..N in the output.
+# In Node Script, map c values to Input<Color> properties via a colorMap.
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -166,7 +180,15 @@ def vec3_to_list(v):
 # ============================================================================
 
 def export_skeleton(armature, normalize_mat):
-    """Export skeleton data in normalized space."""
+    """Export skeleton data in normalized space.
+
+    All bone matrices are in the SAME normalized space with scale forced to 1.
+    IBMs = inverse of normalized bone world matrix (no armature scale baked in).
+    Rest pose = local transform relative to parent, scale always {1,1,1}.
+    Joint indices are 1-based (Luau convention).
+    Rest pose uses ordered arrays (NOT named keys like {x=,y=,z=}).
+    Quaternions are WXYZ (Blender native).
+    """
     bones = armature.data.bones
     arm_world = armature.matrix_world
 
@@ -301,7 +323,13 @@ def export_faces(mesh_obj):
 # ============================================================================
 
 def export_animations(armature, normalize_mat, bone_index):
-    """Export all animations as final local transforms."""
+    """Export all animations as ABSOLUTE local transforms (not deltas).
+
+    For each frame, samples the full evaluated pose and computes the
+    final local transform relative to parent in normalized space.
+    Quaternions are stored in WXYZ format (Blender native).
+    Joint indices are 1-based (Luau convention).
+    """
     animations = {}
 
     if not bpy.data.actions:
@@ -455,7 +483,7 @@ def fmt(n):
 def generate_luau_output(data, part_name="ModelData", bone_count=0):
     """Generate Luau-formatted output string with factorized skinning."""
     lines = []
-    lines.append(f"-- Generated by blender_to_rive.py v2.2")
+    lines.append(f"-- Generated by blender_to_rive.py v3.0")
     lines.append(f"-- Model: {MODEL_NAME}")
     lines.append(f"-- Vertices: {len(data['vertices'])}, Faces: {len(data['faces'])}")
     lines.append(f"-- Using factorized skinning format for smaller file size")
@@ -563,8 +591,8 @@ def generate_luau_output(data, part_name="ModelData", bone_count=0):
 
 def main():
     print("\n" + "=" * 60)
-    print("  BLENDER TO RIVE - Skeletal Animation Exporter v2.2")
-    print("  (Factorized Skinning + Anti-Flickering Support)")
+    print("  BLENDER TO RIVE - Skeletal Animation Exporter v3.0")
+    print("  (Absolute Transforms + Multi-Zone Coloring)")
     print("=" * 60)
 
     armature, mesh_obj = get_armature_and_mesh()
@@ -640,7 +668,7 @@ def main():
         output_path = os.path.join(output_dir, filename)
 
         # Add header for Luau file
-        header = f"--!strict\n-- {filename}\n-- Auto-generated by blender_to_rive.py v2.2\n\nlocal {part_name} = {{}}\n\n"
+        header = f"--!strict\n-- {filename}\n-- Auto-generated by blender_to_rive.py v3.0\n\nlocal {part_name} = {{}}\n\n"
         footer = f"\n\nreturn {part_name}\n"
 
         with open(output_path, 'w') as f:
@@ -654,15 +682,14 @@ def main():
     print("=" * 60)
     print(f"\nOutput directory: {output_dir}")
     print("\nNext steps:")
-    print("  1. Copy the generated .luau files to your Rive project")
-    print("  2. Update require() statements in your main script")
+    print("  1. Copy generated .luau files to your Rive project")
+    print("  2. Update require() statements in your main Node Script")
     print("  3. Use skinningPatterns + skinningIndex (factorized format)")
-    print("  4. Set animationName input to one of the available animations")
-    print("  5. IMPLEMENT ANTI-FLICKERING in Node Script:")
-    print("     - Add 'index' field to ProjectedFace type")
-    print("     - Add 'partDepthOffset' parameter to processFaces")
-    print("     - Use LARGE offsets: 0, 10, 20 (NOT 0.001, 0.002)")
-    print("     - Use table.sort with typed comparator + Z_EPSILON (0.001)")
+    print("  4. Animation data uses ABSOLUTE local transforms (not deltas)")
+    print("  5. Quaternions are WXYZ — SkeletalAnimUtil converts to XYZW")
+    print("  6. Joint indices are 1-based (Luau arrays)")
+    print("  7. For multi-zone coloring: map face.c to Input<Color> via colorMap")
+    print("  8. IMPLEMENT ANTI-FLICKERING in Node Script:")
     print("     - See CLAUDE.md for complete implementation")
     print("\n")
 

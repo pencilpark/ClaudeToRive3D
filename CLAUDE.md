@@ -1,6 +1,6 @@
 # Blender to Rive 3D Export
 
-> **Quick Start:** Run Blender MCP export script → Copy generated `.luau` files to Rive
+> **Quick Start:** Run `blender_to_rive.py` in Blender OR use Claude Code + Blender MCP → Copy generated `.luau` files to Rive
 
 ## ⚠️ IMPORTANT: Read Before Exporting
 
@@ -13,15 +13,19 @@
 7. **Use anti-flickering method** - table.sort + index tiebreaker + depthBias
 8. **Use depthBias per Part file** - Large offsets (0, 10, 20) when parts are separate objects
 9. **Wall-mounted surfaces (screens, panels)** - Hardcode in Node Script + depthBias to force draw order
+10. **Multi-zone coloring** - Assign Blender materials per zone, expose Input<Color> per zone in Node Script
 
 ## Project Structure (Generic Template)
 
 ```
 YOUR_MODEL/
 ├── Model.luau               # Main Node Script (rendering + Property Group)
-├── ModelPartAData.luau      # Part A: ~1900 faces max + skeleton + animations
+├── ModelPartAData.luau      # Part A: ~1900 faces max + skeleton data
 ├── ModelPartBData.luau      # Part B: ~1900 faces max
 ├── ModelPartCData.luau      # Part C: remaining faces (optional)
+├── ModelAnim1Data.luau      # Animation data file 1 (split by size)
+├── ModelAnim2Data.luau      # Animation data file 2 (optional)
+├── ModelAnim3Data.luau      # Animation data file 3 (optional)
 ├── Mesh3DUtil.luau          # 3D math utilities (for animated models)
 ├── SkeletalAnimUtil.luau    # Skeletal animation system
 ├── blender_to_rive.py       # Standalone export script
@@ -29,19 +33,59 @@ YOUR_MODEL/
 └── CLAUDE.md                # This documentation
 ```
 
+**Note on animations:** Animation data is stored separately from Part data files. Each animation file can contain multiple animation clips. Split across multiple files if total size exceeds Rive limits.
+
 ---
+
+## Animation System Format (CRITICAL)
+
+### Data Format (from blender_to_rive.py)
+
+**All data is in the SAME normalized coordinate space:**
+- **Vertices:** Centered, scaled to ~200 units max dimension
+- **IBMs:** Calculated in the same normalized space, scale forced to 1
+- **Rest pose:** Local transforms in normalized space, scale always `{1, 1, 1}`
+- **Animations:** **ABSOLUTE** local transforms per keyframe (NOT deltas)
+
+**Quaternion format:** WXYZ in data files (Blender native: `{w, x, y, z}`).
+`SkeletalAnimUtil` converts to XYZW internally in `buildSkeleton()` and `sampleQuat()`.
+
+**Joint indices:** 1-based in data files (Luau array convention). No `+1` needed in `sampleAnimation()`.
+
+**Skinning patterns:** 0-based bone indices in the patterns table. The `+1` conversion to Luau 1-based is done in `skinVerticesFact()` at runtime.
+
+### Why ABSOLUTE transforms (not deltas)
+
+The export script samples the full evaluated pose at each keyframe frame in Blender, computes the local transform relative to parent (in normalized space), and stores that directly. This means:
+
+- Each keyframe contains the **final** local TRS for that bone at that time
+- The runtime just writes these values directly to `localTransforms[jointIdx]`
+- No delta composition, no `matrix_basis`, no rest-pose multiplication needed
+- Avoids all complexity of FCurve delta interpretation
+
+### SkeletalAnimUtil Pipeline
+
+```
+sampleAnimation()  →  writes absolute local transforms to skeleton.localTransforms
+updateSkeleton()   →  computes worldMatrices (parent chain) and skinMatrices (world * IBM)
+skinVerticesFact() →  transforms each vertex by its bone's skinMatrix
+```
 
 ---
 
 ## Critical Lessons Learned
 
-### 1. File Size Limits
+### 1. NEVER Patch Data Files — Re-Export Instead
+When data files come from an unknown pipeline and don't match the expected format, do NOT try to reverse-engineer and patch. Instead use `blender_to_rive.py` (or reproduce its logic via Blender MCP) to re-export everything. This ensures all data is in the SAME coordinate space.
+
+### 2. File Size Limits
 - **Maximum ~1900 polygons** per Luau script file
 - **Maximum ~2500 vertices** per Luau script file
 - Using category index `c` instead of RGB colors reduces data size significantly
 - **Factorized skinning** reduces file size by ~40% for animated models
+- **Animations stored separately** from part data to avoid exceeding file limits
 
-### 2. Face Data Format (Compact)
+### 3. Face Data Format (Compact)
 ```luau
 -- ❌ WRONG: Verbose RGB colors
 { verts = { 1, 2, 3 }, color = { 255, 199, 51 } }
@@ -50,7 +94,7 @@ YOUR_MODEL/
 { verts = { 1, 2, 3 }, c = 1 }
 ```
 
-### 3. Skinning Data Format (Factorized)
+### 4. Skinning Data Format (Factorized)
 ```luau
 -- ❌ WRONG: Repeated full entries (huge files)
 ModelData.skinning = {
@@ -64,7 +108,7 @@ local S = {
   [0] = {j = {0, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},  -- Root
   [1] = {j = {1, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},  -- Head
   [2] = {j = {2, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},  -- Shoulder.L
-  -- ... one entry per bone (11 max)
+  -- ... one entry per bone
 }
 
 ModelData.skinningPatterns = S
@@ -77,15 +121,38 @@ ModelData.skinningIndex = {1, 1, 1, 6, 6, 2, 2, 9, 9, ...}  -- Just bone indices
 | 228 KB | 139 KB | **-39%** |
 | 102 KB | 65 KB | **-36%** |
 
-### 4. Anti-Flickering System (CRITICAL - 3 Techniques Combined)
+### 5. Multi-Zone Coloring
+
+**Problem:** You want different body parts to have independently controllable colors.
+
+**Solution:**
+1. **In Blender:** Create one material per zone (e.g., M_Body, M_Head, M_Jaw, M_Ears, M_FrontLegs, M_HindLegs, M_Tail)
+2. **Assign materials** to faces via vertex groups or manual selection
+3. **Export** with `blender_to_rive.py` — each material becomes a category index `c=1..N`
+4. **In Node Script:** Expose one `Input<Color>` per zone and build a colorMap
+
+```luau
+-- In processFaces:
+local colorMap: { [number]: Color } = {
+    [1] = self.bodyColor,
+    [2] = self.headColor,
+    [3] = self.jawColor,
+    [4] = self.earColor,
+    [5] = self.frontLegColor,
+    [6] = self.hindLegColor,
+    [7] = self.tailColor,
+}
+local faceColor = colorMap[face.c] or self.bodyColor
+```
+
+### 6. Anti-Flickering System (CRITICAL - 3 Techniques Combined)
 
 **Problem:** Faces with nearly equal depth cause z-fighting flickering during rotation.
 
 **Solution:** Combine 3 techniques for complete anti-flickering:
 
-#### 4.1 ProjectedFace Type with Index
+#### 6.1 ProjectedFace Type with Index
 ```luau
--- Include index field for stable sorting
 export type ProjectedFace = {
     path: Path,
     depth: number,
@@ -94,65 +161,53 @@ export type ProjectedFace = {
 }
 ```
 
-#### 4.2 depthBias Parameter on processFaces
+#### 6.2 depthBias Parameter on processFaces
 ```luau
--- Add optional depthBias parameter to processFaces function
 local function processFaces(
     self: Model3D,
     vertices: { { x: number, y: number, z: number } },
     faces: { { verts: { number }, c: number } },
     -- ... other parameters ...
-    depthBias: number?  -- Optional: shifts depth for sort order without moving geometry
+    depthBias: number?  -- Shifts depth for sort order without moving geometry
 )
     local bias = depthBias or 0
-    -- ...
-    -- Apply bias when calculating depth:
     local avgZ = (sumZ / #transformed) + bias
-    -- ...
-    -- Insert with index for stable sorting:
+
     table.insert(self.projectedFaces, {
         path = facePath,
         depth = avgZ,
         color = litColor,
-        index = #self.projectedFaces + 1,  -- Stable sort index
+        index = #self.projectedFaces + 1,
     })
 end
 ```
 
-**depthBias has two distinct use cases:**
+**depthBias use cases:**
 
-**Case A — Parts represent separate objects** (e.g., robot body / robot head):
 ```luau
--- Each part has non-overlapping geometry → use large bias to separate
-processFaces(self, vertsA, facesA, ..., 0)   -- Part A: reference
-processFaces(self, vertsB, facesB, ..., 10)  -- Part B: offset 10
-processFaces(self, vertsC, facesC, ..., 20)  -- Part C: offset 20
+-- Case A: Parts = separate objects (robot body/head) → large bias
+processFaces(self, vertsA, facesA, ..., 0)   -- Part A
+processFaces(self, vertsB, facesB, ..., 10)  -- Part B
+processFaces(self, vertsC, facesC, ..., 20)  -- Part C
+
+-- Case B: Parts = Z-sorted slices (single mesh) → no bias
+processFaces(self, vertsA, facesA, ..., 0)
+processFaces(self, vertsB, facesB, ..., 0)
+processFaces(self, vertsC, facesC, ..., 0)
+
+-- Case C: Wall-mounted overlay → force to front
+processFaces(self, screenVerts, screenFaces, ..., 100)
 ```
 
-**Case B — Parts are Z-sorted slices of mixed objects** (e.g., room with walls, bed, ceiling all sliced together):
+#### 6.3 Stable Sort with table.sort and Index Tiebreaker
 ```luau
--- Parts overlap in Z range → bias=0 to preserve true Z-ordering
-processFaces(self, vertsA, facesA, ..., 0)   -- Part A: no bias
-processFaces(self, vertsB, facesB, ..., 0)   -- Part B: no bias
-processFaces(self, vertsC, facesC, ..., 0)   -- Part C: no bias
-```
-
-**How to decide:** If Part files are split by sorting ALL faces by avgZ and taking slices → use bias=0. If Part files correspond to distinct mesh objects → use large bias (10, 20).
-
-#### 4.3 Stable Sort with table.sort and Index Tiebreaker
-```luau
--- Sort faces by depth with stable tiebreaker
-local Z_EPSILON = 0.001  -- Threshold for using index as tiebreaker
-local faces = self.projectedFaces
-
+local Z_EPSILON = 0.001
 table.sort(faces, function(a: ProjectedFace, b: ProjectedFace): boolean
     local depthDiff = a.depth - b.depth
     if math.abs(depthDiff) < Z_EPSILON then
-        -- Depths essentially equal: use stable index ordering
-        return a.index < b.index
+        return a.index < b.index  -- Stable tiebreaker
     end
-    -- Sort back to front (smaller depth = further from camera = drawn first)
-    return a.depth < b.depth
+    return a.depth < b.depth  -- Back to front
 end)
 ```
 
@@ -166,7 +221,7 @@ end)
 | faceExpansion | 0.05 | Visual gap between faces |
 | brightness | 50 | Base lighting level (%) |
 
-### 5. Coordinate System (Blender Z-up to Rive)
+### 7. Coordinate System (Blender Z-up to Rive)
 **Blender uses Z-up, Rive screen is X-right, Y-down, Z-into-screen.**
 
 Rotation mapping:
@@ -175,7 +230,6 @@ Rotation mapping:
 - `rotationZ` (roll) → Tilt left/right
 
 ```luau
--- Transform for Z-up Blender model
 local function transformVertex(vx, vy, vz, ...)
   -- Yaw: rotate in XY plane (turntable around Blender Z axis)
   local rx = x * cosY - y * sinY
@@ -192,7 +246,7 @@ local function transformVertex(vx, vy, vz, ...)
 end
 ```
 
-### 6. Mesh3DUtil - Optional for Static Models
+### 8. Mesh3DUtil - Optional for Static Models
 **For static (non-animated) models, Mesh3DUtil is NOT required.**
 
 Only require Mesh3DUtil if using:
@@ -200,9 +254,9 @@ Only require Mesh3DUtil if using:
 - Quaternion math
 - Skeletal animation
 
-### 7. Wall-Mounted Surfaces (Screens, Panels, Signs)
+### 9. Wall-Mounted Surfaces (Screens, Panels, Signs)
 
-**Problem:** Flat surfaces on walls (TV screens, info panels, signs) cause Z-fighting with the wall behind them, regardless of geometric offset. Small offsets fail at rotation angles because projected Z-difference shrinks. Large offsets cause the surface to visually "detach" from the wall during rotation.
+**Problem:** Flat surfaces on walls cause Z-fighting regardless of geometric offset.
 
 **Solution: Decouple visual position from sort order using `depthBias`.**
 
@@ -213,9 +267,6 @@ Only require Mesh3DUtil if using:
 5. **Use large `depthBias`** (99-100) to force it to always draw IN FRONT of everything
 
 ```luau
--- Example: TV Screen hardcoded in Node Script
--- Wall at x≈-52.5. Screen at x=-51 (visually flush, 1.5 units from wall).
--- depthBias=100 forces screen to sort AFTER all wall faces at any angle.
 local tvScreenVerts: { { x: number, y: number, z: number } } = {
     {x=-51, y=48.66, z=-8.82},
     {x=-51, y=83.91, z=-8.82},
@@ -223,76 +274,142 @@ local tvScreenVerts: { { x: number, y: number, z: number } } = {
     {x=-51, y=48.66, z=17.61},
 }
 local tvScreenFaces: { { verts: { number }, c: number } } = {
-    {verts = {1, 2, 3}, c = 12},  -- 2 triangles = 1 rectangle
+    {verts = {1, 2, 3}, c = 12},
     {verts = {1, 3, 4}, c = 12},
 }
--- Process with depthBias=100 (drawn last = in front)
 processFaces(self, tvScreenVerts, tvScreenFaces, ..., 100)
-```
-
-**Why this works:** `depthBias` adds +100 to the depth used for sorting, but does NOT move the geometry. The screen is visually at x=-51 (flush with wall) but sorts as if it were 100 units closer to camera. No rotation angle can overcome a 100-unit depth advantage.
-
-**When to use:** Any surface that must always render on top of the surface behind it, at all rotation angles. Typical examples:
-- TV screens on walls
-- Emissive borders/bezels around screens
-- Wall-mounted info panels or signs
-- Decals that must never flicker with the wall
-
-**Layering multiple overlays:** Use incrementing bias values to control stacking order:
-```luau
-processFaces(self, borderVerts, borderFaces, ..., 99)   -- Border: behind screen
-processFaces(self, screenVerts, screenFaces, ..., 100)   -- Screen: on top
 ```
 
 ---
 
-## Export Workflow (Blender MCP)
+## Export Workflow
 
-### Step 1: Analyze Model
+### Option A: blender_to_rive.py (Standalone Script)
+1. Open your `.blend` file
+2. Configure `MODEL_NAME` and settings at top of script
+3. Run script (`Alt+P` in Text Editor)
+4. Copy generated `.luau` files to your Rive project
+
+### Option B: Claude Code + Blender MCP
+1. Connect Blender MCP
+2. Claude analyzes the model (bones, materials, vertex count)
+3. Claude runs the export logic step-by-step via Python in Blender
+4. Claude generates the `.luau` files directly
+
+Both produce the same output format: normalized space, absolute transforms, WXYZ quaternions, 1-based joint indices.
+
+### Export Steps (both methods)
+
+#### Step 1: Analyze Model
 ```python
 obj = bpy.data.objects.get("ModelName")
-# Check: vertex count, polygon count, materials
+# Check: vertex count, polygon count, materials, armature
 ```
 
-### Step 2: Normalize Coordinates
+#### Step 2: Normalize Coordinates
 ```python
 # Center and scale to ~200 units
 center = (min_coord + max_coord) / 2
 scale_factor = 200 / max_dimension
-normalized = (world_coord - center) * scale_factor
+normalize_mat = Scale(scale_factor) @ Translate(-center)
 ```
 
-### Step 3: Categorize Materials
+#### Step 3: Export Skeleton (in normalized space)
 ```python
-# Map materials to category indices 1-N
+# For each bone:
+bone_world = arm_world @ bone.matrix_local
+bone_normalized = normalize_mat @ bone_world
+loc, rot, _ = bone_normalized.decompose()
+bone_mat = LocRotScale(loc, rot, (1,1,1))  # Force scale=1
+ibm = bone_mat.inverted()
+# Local transform = parent_mat.inv @ bone_mat
+```
+
+#### Step 4: Export Animations (ABSOLUTE local transforms)
+```python
+# For each frame, for each bone:
+bpy.context.scene.frame_set(frame)
+pose_world = arm_world @ pose_bone.matrix
+pose_normalized = normalize_mat @ pose_world
+loc, rot, _ = pose_normalized.decompose()
+pose_mat = LocRotScale(loc, rot, (1,1,1))
+local_mat = parent_mat.inv @ pose_mat  # This IS the final local transform
+# Store translation + rotation as WXYZ
+```
+
+#### Step 5: Categorize Materials
+```python
 material_categories = {mat.name: i + 1 for i, mat in enumerate(materials)}
 ```
 
-### Step 4: Sort Faces by Depth
+#### Step 6: Sort Faces by Depth
 ```python
-# Sort by avgZ BEFORE splitting into files
 all_faces.sort(key=lambda f: avg_z(f))
 ```
 
-### Step 5: Fragment with Vertex Optimization
+#### Step 7: Fragment with Vertex Optimization
 ```python
 # Each part gets ONLY its used vertices (remapped indices)
 def extract_part_data(faces_slice, all_vertices):
     used_indices = set(vi for f in faces_slice for vi in f['verts'])
     index_map = {old: new+1 for new, old in enumerate(sorted(used_indices))}
-    # Extract and remap...
 ```
 
-### Step 6: Factorize Skinning (for animated models)
+#### Step 8: Factorize Skinning
 ```python
-# Create patterns table (one per bone)
 patterns = {}
 for i in range(bone_count):
     patterns[i] = {"j": [i, 0, 0, 0], "w": [1.0, 0.0, 0.0, 0.0]}
-
-# Store just the bone index per vertex
-skinning_index = [skin["j"][0] for skin in all_skinning]
+skinning_index = [primary_bone_per_vertex]
 ```
+
+---
+
+## Output Data Structure
+
+### Part Data File (e.g., ModelPartAData.luau)
+```luau
+-- Skeleton (first part only)
+ModelData.skeleton = {
+  jointCount = N,
+  jointParents = { nil, 1, 2, ... },         -- 1-based, nil for roots
+  inverseBindMatrices = { {16 floats}, ... }, -- Column-major, scale=1
+  restPose = {
+    { translation = {x, y, z}, rotation = {w, x, y, z}, scale = {1, 1, 1} },
+    ...
+  },
+}
+
+-- Vertices and faces
+ModelData.vertices = { {x=0, y=0, z=0}, ... }
+ModelData.faces = { {verts={1,2,3}, c=1}, ... }
+
+-- Factorized skinning
+ModelData.skinningPatterns = S  -- {[0]={j={0,0,0,0},w={1,0,0,0}}, ...}
+ModelData.skinningIndex = {1, 1, 1, 6, 6, ...}  -- Bone index per vertex
+```
+
+### Animation Data File (e.g., ModelAnim1Data.luau)
+```luau
+ModelData.animations = {
+  ["idle_Root_00"] = {
+    name = "idle_Root_00",
+    duration = 1.5,
+    channels = {
+      { jointIndex = 1, path = "rotation", times = {...}, values = {w,x,y,z,...} },
+      { jointIndex = 1, path = "translation", times = {...}, values = {x,y,z,...} },
+      ...
+    },
+  },
+  ...
+}
+```
+
+**Key format details:**
+- `jointIndex` is **1-based** (Luau arrays)
+- Rotation values are **WXYZ** (Blender native)
+- Translation/scale values are `{x, y, z}`
+- All transforms are **ABSOLUTE** (not deltas from rest pose)
 
 ---
 
@@ -303,12 +420,17 @@ skinning_index = [skin["j"][0] for skin in all_skinning]
 | Faces flickering | Z-fighting from coplanar faces | Use 3-technique anti-flickering: index + depthBias + table.sort |
 | Flickering between Parts (separate objects) | Parts from different files compete | Use LARGE depthBias (10, 20) per part |
 | Flickering between Parts (Z-sliced) | Parts overlap in Z range | Use depthBias=0 for all parts |
-| Screen/panel flickers on wall | Coplanar surface competes with wall | Hardcode in Node Script + depthBias=100 (see section 7) |
+| Screen/panel flickers on wall | Coplanar surface competes with wall | Hardcode in Node Script + depthBias=100 |
 | Screen "detaches" from wall | Geometric offset too large | Use small geometric offset + large depthBias instead |
+| Model disappears when animated | Data format mismatch | Re-export with blender_to_rive.py (see lesson 1) |
+| Animation looks wrong | Delta vs absolute confusion | Ensure data has ABSOLUTE transforms (not FCurve deltas) |
+| Quaternion corruption | WXYZ vs XYZW mismatch | Data files: WXYZ. SkeletalAnimUtil converts internally |
+| `localTransforms[0]` is nil | 0-based jointIndex | Ensure jointIndex is 1-based in data files |
+| `{x=1}[1]` returns nil | Named keys vs ordered arrays | Use ordered arrays `{v1, v2, v3}` in data files |
 | Objects behind terrain | Wrong depth sort direction | Use `depth < depth` for back-to-front |
 | Model rotates wrong axis | Y-up vs Z-up confusion | Yaw rotates in XY plane for Z-up models |
 | Faces disappear | Wrong backface culling | Check normal direction `nz < 0` |
-| Colors all same | Not using category index | Use `c = index` format |
+| Colors all same | Not using category index | Use `c = index` format with colorMap |
 | File too large / typecheck error | Too many repeated skinning entries | Use factorized skinning format |
 | Rotation doesn't work | rotationSpeed on wrong axis | Apply to Yaw (XY rotation) |
 | Animation doesn't update | Missing markNeedsUpdate | Store context, call `context:markNeedsUpdate()` |
@@ -339,6 +461,10 @@ local function advance(self: Model3D, seconds: number): boolean
       self.context:markNeedsUpdate()  -- Wake render loop
     end
   end
+  -- Also wake for animation
+  if self.animationEnabled and self.context then
+    self.context:markNeedsUpdate()
+  end
   return true
 end
 ```
@@ -350,23 +476,22 @@ end
 ```luau
 type SkinEntry = { j: { number }, w: { number } }
 
-local function skinVertices(
+local function skinVerticesFact(
     skeleton: SkelAnim.Skeleton,
     vertices: { { x: number, y: number, z: number } },
     skinningPatterns: { [number]: SkinEntry },
     skinningIndex: { number }
 ): { { x: number, y: number, z: number } }
     local result = {}
-
     for i, v in ipairs(vertices) do
-        local skinIdx = skinningIndex[i]        -- Get bone index
-        local skin = skinningPatterns[skinIdx]  -- Get pattern from table
+        local skinIdx = skinningIndex[i]
+        local skin = skinningPatterns[skinIdx]
         local sx, sy, sz = 0.0, 0.0, 0.0
 
         for k = 1, 4 do
-            local jointIdx = skin.j[k] + 1
+            local jointIdx = skin.j[k] + 1  -- 0-based pattern → 1-based Luau
             local weight = skin.w[k]
-            if weight > 0 and jointIdx >= 1 then
+            if weight > 0 and jointIdx >= 1 and jointIdx <= skeleton.jointCount then
                 local skinMat = skeleton.skinMatrices[jointIdx]
                 if skinMat then
                     local tx, ty, tz = M.mat4TransformPoint(skinMat, v.x, v.y, v.z)
@@ -380,11 +505,6 @@ local function skinVertices(
     end
     return result
 end
-
--- Usage in advance():
-local skinPatterns = (PartAData :: any).skinningPatterns :: { [number]: SkinEntry }
-local skinIndex = (PartAData :: any).skinningIndex :: { number }
-self.skinnedVerts = skinVertices(skeleton, vertices, skinPatterns, skinIndex)
 ```
 
 ---
@@ -393,11 +513,14 @@ self.skinnedVerts = skinVertices(skeleton, vertices, skinPatterns, skinIndex)
 
 - [ ] Model analyzed (vertex/polygon count, materials)
 - [ ] Coordinate system identified (Z-up = Blender default)
-- [ ] Materials mapped to category indices
+- [ ] Materials mapped to category indices (one per color zone)
 - [ ] Using `c=index` format (NOT RGB)
 - [ ] Faces will be sorted by avgZ
 - [ ] Each part will have only its used vertices
 - [ ] Skinning data will be factorized (patterns + index)
+- [ ] Animations exported as ABSOLUTE local transforms (not deltas)
+- [ ] Quaternions in WXYZ format in data files
+- [ ] Joint indices are 1-based in data files
 - [ ] `context:markNeedsUpdate()` for auto-rotation/animation
 - [ ] For Z-up: Yaw rotates in XY plane (cosY/sinY on x,y)
 - [ ] **Anti-flickering implemented:**
@@ -406,6 +529,10 @@ self.skinnedVerts = skinVertices(skeleton, vertices, skinPatterns, skinIndex)
   - [ ] depthBias: 0 for Z-sliced parts, 0/10/20 for object-based parts
   - [ ] table.sort with typed comparator + Z_EPSILON (0.001) + index tiebreaker
   - [ ] faceExpansion = 0.05, brightness = 50
+- [ ] **Multi-zone coloring** (if applicable):
+  - [ ] Materials assigned in Blender (one per zone)
+  - [ ] Input<Color> per zone in Node Script
+  - [ ] colorMap in processFaces
 - [ ] **Wall-mounted surfaces** (if any screens, panels, signs):
   - [ ] Removed from Blender, hardcoded in Node Script
   - [ ] Positioned close to wall (1-2 normalized units)
@@ -415,7 +542,7 @@ self.skinnedVerts = skinVertices(skeleton, vertices, skinPatterns, skinIndex)
 
 ## Performance Notes
 
-- **4544 faces** renders smoothly with table.sort
+- **4928 faces** renders smoothly with table.sort
 - table.sort with typed comparator works well for <10k faces
 - Each frame: transform → cull → light → project → sort → draw
 - Paths created in `advance()`, only drawn in `draw()`
@@ -429,35 +556,35 @@ self.skinnedVerts = skinVertices(skeleton, vertices, skinPatterns, skinIndex)
 ## Default Values (Optimized)
 
 ```luau
--- Recommended defaults for new 3D models
 rotationSpeed = 10,       -- Visible rotation for testing
 brightness = 50,          -- Base lighting 50%
 faceExpansion = 0.05,     -- Visual gap between faces
 backfaceCulling = true,   -- Cull back-facing polygons
+animationSpeed = 1,       -- Normal playback speed
 ```
 
 ## Workflow Orchestration
 
 ### 1. Plan Mode Default
-Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)If something goes sideways, STOP and re-plan immediately - don't keep pushingUse plan mode for verification steps, not just buildingWrite detailed specs upfront to reduce ambiguity
+Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions). If something goes sideways, STOP and re-plan immediately - don't keep pushing. Use plan mode for verification steps, not just building. Write detailed specs upfront to reduce ambiguity.
 
 ### 2. Subagent Strategy to keep main context window clean
-Offload research, exploration, and parallel analysis to subagentsFor complex problems, throw more compute at it via subagentsOne task per subagent for focused execution
+Offload research, exploration, and parallel analysis to subagents. For complex problems, throw more compute at it via subagents. One task per subagent for focused execution.
 
 ### 3. Self-Improvement Loop
-After ANY correction from the user: update 'tasks/lessons.md' with the patternWrite rules for yourself that prevent the same mistakeRuthlessly iterate on these lessons until mistake rate dropsReview lessons at session start for relevant project
+After ANY correction from the user: update `tasks/lessons.md` with the pattern. Write rules for yourself that prevent the same mistake. Ruthlessly iterate on these lessons until mistake rate drops. Review lessons at session start for relevant project.
 
 ### 4. Verification Before Done
-Never mark a task complete without proving it worksDiff behavior between main and your changes when relevantAsk yourself: "Would a staff engineer approve this?"Run tests, check logs, demonstrate correctness
+Never mark a task complete without proving it works. Diff behavior between main and your changes when relevant. Ask yourself: "Would a staff engineer approve this?" Run tests, check logs, demonstrate correctness.
 
 ### 5. Demand Elegance (Balanced)
-For non-trivial changes: pause and ask "is there a more elegant way?"If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"Skip this for simple, obvious fixes - don't over-engineerChallenge your own work before presenting it
+For non-trivial changes: pause and ask "is there a more elegant way?" If a fix feels hacky: "Knowing everything I know now, implement the elegant solution." Skip this for simple, obvious fixes - don't over-engineer. Challenge your own work before presenting it.
 
 ### 6. Autonomous Bug Fixing
-When given a bug report: just fix it. Don't ask for hand-holdingPoint at logs, errors, failing tests -> then resolve themZero context switching required from the userGo fix failing CI tests without being told how
+When given a bug report: just fix it. Don't ask for hand-holding. Point at logs, errors, failing tests -> then resolve them. Zero context switching required from the user. Go fix failing CI tests without being told how.
 
 ## Task Management
-**Plan First**: Write plan to 'tasks/todo.md' with checkable items**Verify Plan**: Check in before starting implementation**Track Progress**: Mark items complete as you go**Explain Changes**: High-level summary at each step**Document Results**: Add review to 'tasks/todo.md'**Capture Lessons**: Update 'tasks/lessons.md' after corrections
+**Plan First**: Write plan to `tasks/todo.md` with checkable items. **Verify Plan**: Check in before starting implementation. **Track Progress**: Mark items complete as you go. **Explain Changes**: High-level summary at each step. **Document Results**: Add review to `tasks/todo.md`. **Capture Lessons**: Update `tasks/lessons.md` after corrections.
 
 ## Core Principles
-**Simplicity First**: Make every change as simple as possible. Impact minimal code.**No Laziness**: Find root causes. No temporary fixes. Senior developer standards.**Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+**Simplicity First**: Make every change as simple as possible. Impact minimal code. **No Laziness**: Find root causes. No temporary fixes. Senior developer standards. **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
