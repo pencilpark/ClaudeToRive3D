@@ -22,6 +22,7 @@
 12. **⚠️ "POSED REST" = no action + pose_position='POSE'** — The default appearance WITH `matrix_basis`. Skeleton IBMs, vertices, AND animations must ALL use this same reference. `bone.matrix_local` for IBMs but `pose_bone.matrix` for animations causes massive offsets!
 13. **Static channel optimization: compare against POSED REST** — NOT just frame-to-frame constancy. Keep constant-but-different-from-posed-rest as 2-keyframe channels.
 14. **ANIMATIONS = ABSOLUTE transforms** — NOT deltas from rest pose. Export final local TRS per keyframe.
+15. **⚠️ RE-EXPORT TRAP: Quaternion sign ambiguity** — `decompose()` is NOT unique (`q` ≡ `-q`). When re-exporting animations in a new session, compare rest local quaternion dot product vs file. If dot < 0.95 → use `matrix_basis` delta. Non-keyed bones → exact file rest values. See Step 8b.
 
 ---
 
@@ -121,6 +122,20 @@ ibm = bone_mat.inverted()
 # DO NOT reset matrix_basis!
 # Sample ABSOLUTE local transforms per frame per bone
 # Store: translation {x,y,z}, rotation {w,x,y,z} (WXYZ)
+```
+
+### Step 8b: Re-Export Safe Sampling (when Part files already exist)
+```python
+# ⚠️ ONLY when re-exporting animations for an existing model
+# 1. Parse rest pose from existing Part file
+# 2. Detect mismatched bones: dot(blender_rest_local.rot, file_rest_local.rot) < 0.95
+# 3. Get keyframed bone names from action FCurves
+# 4. Three-tier hybrid:
+#    - NOT keyed → exact file rest values (translation + rotation)
+#    - Keyed + match (dot ≥ 0.95) → file_rest_local × (blender_rest_local⁻¹ × anim_local)
+#    - Keyed + mismatch (dot < 0.95) → file_rest_local × (rest_basis⁻¹ × frame_basis)
+# 5. Animation composition: merge Idle channels with partial animations
+#    (e.g., Yes = Idle body breathing + Head nod from Yes action)
 ```
 
 ### Step 9: Optimize Channels
@@ -375,6 +390,9 @@ ModelData.animations = {
 | Non-triangular faces | Quads/ngons | Triangulate via bmesh |
 | `StructRNA removed` | Freed evaluated mesh | Use temp mesh copy |
 | `rotationSpeed` broken | No markNeedsUpdate | Store context |
+| **Fingers stretched on re-export** | **Quaternion sign ambiguity (dot < 0.95)** | **`matrix_basis` delta for mismatched bones** |
+| **Re-export differs from original** | **`decompose()` not unique across sessions** | **Three-tier hybrid sampling (Step 8b)** |
+| **Body frozen in partial anim** | **Only head/hands keyed, rest at rest pose** | **Animation composition: merge Idle + target** |
 
 ---
 
@@ -395,3 +413,6 @@ ModelData.animations = {
 - [ ] ABSOLUTE WXYZ transforms, 1-based joints
 - [ ] Anti-flickering + depthBias
 - [ ] `context:markNeedsUpdate()` for rotation/animation
+- [ ] **Re-export: quaternion mismatch detection** (rest local dot < 0.95)
+- [ ] **Re-export: hybrid sampling** (non-keyed → file rest, keyed → delta or matrix_basis delta)
+- [ ] **Partial animations: composition with Idle** (resample + looping)

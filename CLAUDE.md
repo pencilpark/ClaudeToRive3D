@@ -1,6 +1,10 @@
 # Blender to Rive 3D Export — Universal Guide
+## Identity
+AI assistant for Rive scripting in **pure Luau** (no Roblox libraries).
+Prioritize working patterns over theoretical completeness.
+Always use `--!strict` mode.
 
-> **Quick Start:** Run `blender_to_rive.py` in Blender OR use Claude Code + Blender MCP → Copy generated `.luau` files to Rive
+> **Quick Start:** USE FIRST Claude Code + Blender MCP → Copy generated `.luau` files to Rive OR Run `blender_to_rive.py` in Blender if needed
 
 ## ⚠️ CRITICAL RULES (Read Before Exporting)
 
@@ -21,17 +25,33 @@
 
 ---
 
+## Primary Reference (LERP)
+
+**FETCH before starting any Rive scripting session:**
+```
+https://forge.mograph.life/apps/lerp/quick-reference
+https://forge.mograph.life/apps/lerp/api/core-types
+https://forge.mograph.life/apps/lerp/api/drawing
+```
+
+**FETCH when needed:**
+- Complex interactions: `https://forge.mograph.life/apps/lerp/rive/environment`
+- Lifecycle issues: `https://forge.mograph.life/apps/lerp/getting-started/how-rive-scripts-work`
+- ViewModels: `https://forge.mograph.life/apps/lerp/advanced/viewmodels`
+- Procedural graphics: `https://forge.mograph.life/apps/lerp/advanced/procedural`
+
+
 ## Project Structure (Generic Template)
 
 ```
 YOUR_MODEL/
 ├── Model.luau               # Main Node Script (rendering + Property Group)
-├── ModelPartAData.luau      # Part A: ~1900 faces max + skeleton data
-├── ModelPartBData.luau      # Part B: ~1900 faces max
-├── ModelPartCData.luau      # Part C: remaining faces (optional)
-├── ModelAnim1Data.luau      # Animation data file 1 (split by size)
-├── ModelAnim2Data.luau      # Animation data file 2 (optional)
-├── ModelAnim3Data.luau      # Animation data file 3 (optional)
+├── ModelPartA.luau      # Part A: ~1900 faces max + skeleton data
+├── ModelPartB.luau      # Part B: ~1900 faces max
+├── ModelPartC.luau      # Part C: remaining faces (optional)
+├── ModelAnim1.luau      # Animation data file 1 (split by size)
+├── ModelAnim2.luau      # Animation data file 2 (optional)
+├── ModelAnim3.luau      # Animation data file 3 (optional)
 ├── Mesh3DUtil.luau          # 3D math utilities (for animated models)
 ├── SkeletalAnimUtil.luau    # Skeletal animation system
 ├── blender_to_rive.py       # Universal export script (v5.0)
@@ -39,7 +59,7 @@ YOUR_MODEL/
 └── CLAUDE.md                # This documentation
 ```
 
-**File naming convention:** `{MODEL_NAME}Part{A,B,C,...}Data.luau` and `{MODEL_NAME}Anim{1,2,3,...}Data.luau`. Configure `MODEL_NAME` in `blender_to_rive.py` settings.
+**File naming convention:** `{MODEL_NAME}Part{A,B,C,...}.luau` and `{MODEL_NAME}Anim{1,2,3,...}.luau`. Configure `MODEL_NAME` in `blender_to_rive.py` settings.
 
 **Animations** are stored in separate files from Part data. Each animation file can contain multiple clips. Split across files if total size exceeds Rive limits.
 
@@ -253,6 +273,136 @@ When removing constant animation channels:
 - ✅ Remove if constant AND matches **posed rest** (epsilon 0.0001) — bone stays at default
 - ✅ Keep as 2-keyframe if constant but **differs from posed rest** — bone needs this value
 - ❌ NEVER remove just because constant between frames — may be constant at a non-default value!
+
+---
+
+## ⚠️ Quaternion Sign Ambiguity & Re-Export (THE #2 EXPORT TRAP)
+
+### Problem
+`Matrix.decompose()` returns a quaternion, but **`q` and `-q` represent the same 3D rotation**. Blender may choose a different sign/decomposition path between sessions. When `matrix_basis` is restored in a new Blender session, `pose_bone.matrix.decompose()` can yield quaternions that differ from the original export — not just by sign, but by fundamentally different decomposition paths (e.g., `(0.225, -0.012, -0.053, -0.973)` vs `(0.225, -0.012, +0.053, +0.973)`).
+
+### Why It Matters
+In a skeleton chain, the local quaternion of a parent bone defines the coordinate space for all its children. A different decomposition at the parent **cascades through the entire chain**, causing child bones (especially fingers) to stretch, twist, or fly off. This cannot be fixed by simply negating the quaternion.
+
+### When This Happens
+- **Re-exporting animations** in a new Blender session after the original Part files were already written
+- **Adding new animations** to an existing model
+- **Any scenario** where `matrix_basis` was saved/restored across sessions
+
+### Detection: Rest Local Dot Product
+Compare Blender's current rest local quaternion vs the file's rest local quaternion for each bone:
+
+```python
+# Parse rest pose from existing Part file
+file_rest_locals = parse_from_file(part_file)  # {joint_idx: {translation, rotation}}
+
+# Compute Blender's current rest locals
+armature.animation_data.action = None
+armature.data.pose_position = 'POSE'
+bpy.context.view_layer.update()
+
+mismatched_bones = set()
+for idx, name in enumerate(bone_order):
+    file_rot = Quaternion(file_rest_locals[idx+1]['rotation'])  # WXYZ
+    blender_rot = compute_current_rest_local(name).rotation
+    dot = abs(file_rot.dot(blender_rot))
+    if dot < 0.95:
+        mismatched_bones.add(idx + 1)
+        print(f"⚠️ J{idx+1}({name}): dot={dot:.3f} → MISMATCHED")
+```
+
+### Resolution: Three-Tier Hybrid Sampling
+
+When re-exporting animations (Part files already exist), use this strategy:
+
+```python
+for each bone in each animation frame:
+    if bone NOT keyframed in this action:
+        # Tier 1: Exact file rest values (no sampling)
+        use file_rest_locals[joint_idx]  # translation + rotation
+
+    elif bone IS keyframed AND NOT mismatched (dot ≥ 0.95):
+        # Tier 2: World-space delta (classic approach)
+        delta = blender_rest_local.inverted() @ blender_anim_local
+        corrected = file_rest_local @ delta
+
+    elif bone IS keyframed AND mismatched (dot < 0.95):
+        # Tier 3: matrix_basis delta (bypasses decomposition issues)
+        rest_basis = pose_bone.matrix_basis at rest (no action)
+        frame_basis = pose_bone.matrix_basis at animation frame
+        delta_basis = rest_basis.inverted() @ frame_basis
+        corrected = file_rest_local_matrix @ delta_basis
+```
+
+### Why `matrix_basis` Delta Works
+`matrix_basis` is the bone-local transform that Blender applies on top of the rest pose. It captures the animation change **independently of how the world-space matrix gets decomposed**. The delta `rest_basis⁻¹ × frame_basis` represents the pure local animation change, which can be safely composed with the file's rest local transform.
+
+### Keyframed Bone Detection
+Only bones **directly keyframed** in an action should be sampled. Use FCurve analysis:
+
+```python
+def get_animated_bones(action):
+    """Return set of bone names with actual keyframes in this action."""
+    animated = set()
+    for fc in action.fcurves:
+        if fc.data_path.startswith("pose.bones["):
+            bone_name = fc.data_path.split('"')[1]
+            animated.add(bone_name)
+    return animated
+```
+
+Non-keyframed bones receive **exact file rest values** — never sampled, never delta'd.
+
+---
+
+## Animation Composition (Merging Idle + Targeted Animations)
+
+### Use Case
+Some animations only affect a subset of bones (e.g., "Yes" = head nod, "No" = head shake) but the rest of the body should keep its Idle breathing motion, not freeze.
+
+### Pattern
+Merge Idle animation channels with the targeted animation's specific channels:
+
+```python
+# 1. Parse Idle animation from existing Anim file
+idle_channels = parse_idle_from_file()  # All channels from Idle clip
+
+# 2. Get the targeted animation's specific channels (e.g., Head rotation for Yes)
+target_channels = sample_target_animation()  # Only the keyed bones
+
+# 3. Merge: for each Idle channel
+for idle_ch in idle_channels:
+    if target_animation_overrides_this_bone_and_path(idle_ch):
+        # Use target animation's channel (e.g., Head rotation from Yes)
+        merged_channels.append(target_channel)
+    else:
+        # Resample Idle at target animation's frame times
+        resampled = resample_idle_channel(idle_ch, target_times, target_duration)
+        merged_channels.append(resampled)
+```
+
+### Resampling with Linear Interpolation + Looping
+When the target animation has different duration/timing than Idle:
+
+```python
+def resample_channel(source_times, source_values, target_times, stride):
+    """Resample source channel at target frame times with looping."""
+    source_duration = source_times[-1]
+    result = []
+    for t in target_times:
+        # Loop within source duration
+        t_loop = t % source_duration if source_duration > 0 else 0
+        # Find bracketing keyframes and lerp
+        value = interpolate_at_time(source_times, source_values, t_loop, stride)
+        result.extend(value)
+    return result
+```
+
+### When to Use Animation Composition
+- **Head gestures** (Yes, No, Look) → Head channels from gesture + Idle body
+- **Facial expressions** → Face bone channels + Idle body
+- **Hand gestures** → Hand channels from gesture + Idle body
+- **Any partial-body animation** where freezing the rest of the body looks unnatural
 
 ---
 
@@ -489,7 +639,7 @@ end
 
 ## Output Data Structure
 
-### Part Data File (e.g., ModelPartAData.luau)
+### Part Data File (e.g., ModelPartA.luau)
 ```luau
 -- Skeleton (first part only)
 ModelData.skeleton = {
@@ -511,7 +661,7 @@ ModelData.skinningPatterns = S
 ModelData.skinningIndex = {1, 1, 1, 6, 6, ...}
 ```
 
-### Animation Data File (e.g., ModelAnim1Data.luau)
+### Animation Data File (e.g., ModelAnim1.luau)
 ```luau
 ModelData.animations = {
   ["walk"] = {
@@ -658,6 +808,9 @@ Both produce the same output format.
 | Non-triangular faces | Quads/ngons in mesh | Triangulate via bmesh at export |
 | `StructRNA removed` error | Evaluated mesh freed too early | Use separate temp mesh for bmesh |
 | Colors all same | Not using category index | Use `c=index` format |
+| **Fingers stretched/distorted on re-export** | **Quaternion sign ambiguity in rest local decomposition** | **Detect mismatched bones (dot < 0.95), use `matrix_basis` delta** |
+| **Re-export produces different results** | **`decompose()` yields different quaternions across sessions** | **Three-tier hybrid sampling (see Quaternion Sign Ambiguity section)** |
+| **Body frozen during partial animation** | **Only head/hands animated, rest receives rest pose** | **Animation composition: merge Idle channels with targeted animation** |
 
 ---
 
@@ -685,6 +838,9 @@ Both produce the same output format.
 - [ ] **Anti-flickering**: index field + depthBias + Z_EPSILON sort
 - [ ] **Multi-zone coloring** (if applicable): materials → colorMap
 - [ ] **Wall-mounted surfaces** (if any): hardcode + depthBias=100
+- [ ] **Re-export: quaternion mismatch detection** (dot < 0.95 between Blender and file rest locals)
+- [ ] **Re-export: hybrid sampling** (non-keyed → file rest, keyed+match → delta, keyed+mismatch → matrix_basis delta)
+- [ ] **Partial animations: composition with Idle** (resample Idle channels at target timing with looping)
 
 ---
 
@@ -718,7 +874,7 @@ Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions). 
 ### 2. Subagent Strategy
 Offload research, exploration, and parallel analysis to subagents. One task per subagent.
 
-### 3. Self-Improvement Loop
+### 3. MANDATORY: Self-Improvement Loop MANDATORY
 After ANY correction: update `tasks/lessons.md`. Write rules to prevent the same mistake.
 
 ### 4. Verification Before Done
@@ -731,7 +887,12 @@ For non-trivial changes: "is there a more elegant way?" Skip for simple fixes.
 Given a bug report: just fix it. No hand-holding required.
 
 ## Task Management
-**Plan First** → **Verify Plan** → **Track Progress** → **Explain Changes** → **Document Results** → **Capture Lessons**
+**Plan First** 
+→ **Verify Plan** 
+→ **Track Progress** 
+→ **Explain shortyly Changes** 
+→ **Document Results** 
+→ **Capture Lessons**
 
 ## Core Principles
 **Simplicity First** · **No Laziness** · **Minimal Impact** · **Root Causes Only**

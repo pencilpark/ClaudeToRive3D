@@ -32,7 +32,7 @@ Usage:
 Can also be executed step-by-step via Blender MCP (preferred for debugging).
 
 Author: Claude + Fred Berria
-Version: 5.0.0 (Universal Multi-Mesh + Posed Rest + Verified Export)
+Version: 5.1.0 (Universal Multi-Mesh + Posed Rest + Verified Export + Re-Export Mode)
 """
 
 import bpy
@@ -62,6 +62,18 @@ ANIM_NAME_MAP = None  # or {"RobotArmature|Robot_Idle_RobotArmature": "Idle", ..
 # How to split animations across files (list of lists of short names)
 # Set to None for automatic splitting (~3 anims per file)
 ANIM_FILE_SPLIT = None  # or [["Idle", "Walking", "Running"], ["Dance", "Wave", "Yes", "No"], ...]
+
+# ============================================================================
+# RE-EXPORT MODE (for adding/fixing animations when Part files already exist)
+# ============================================================================
+# When True: uses three-tier hybrid sampling to handle quaternion sign ambiguity
+# - Non-keyed bones → exact file rest values
+# - Keyed + good match (dot ≥ 0.95) → world-space delta
+# - Keyed + mismatch (dot < 0.95) → matrix_basis delta
+# When False: standard export (original behavior, used for first-time exports)
+RE_EXPORT_MODE = False
+RE_EXPORT_REST_FILE = None  # Path to existing PartA .luau file with skeleton data
+MISMATCH_THRESHOLD = 0.95   # Quaternion dot product threshold for mismatch detection
 
 
 # ============================================================================
@@ -470,13 +482,121 @@ def factorize_skinning(skin_data):
 
 
 # ============================================================================
+# STEP 5b: RE-EXPORT HELPERS (Quaternion mismatch detection + file parsing)
+# ============================================================================
+
+def parse_rest_pose_from_file(filepath):
+    """Parse rest pose data from an existing Part .luau file.
+    Returns dict: {joint_index(1-based): {translation: [x,y,z], rotation: [w,x,y,z]}}
+    """
+    import re
+    rest_data = {}
+    with open(filepath, 'r') as f:
+        content = f.read()
+
+    # Find restPose block
+    rest_match = re.search(r'restPose\s*=\s*\{(.*?)\n\s*\}', content, re.DOTALL)
+    if not rest_match:
+        raise RuntimeError(f"Could not find restPose in {filepath}")
+
+    entries = re.findall(
+        r'\{translation\s*=\s*\{([^}]+)\},\s*rotation\s*=\s*\{([^}]+)\},\s*scale\s*=\s*\{[^}]+\}\}',
+        rest_match.group(1)
+    )
+
+    for i, (trans_str, rot_str) in enumerate(entries):
+        trans = [float(x.strip()) for x in trans_str.split(',')]
+        rot = [float(x.strip()) for x in rot_str.split(',')]
+        rest_data[i + 1] = {'translation': trans, 'rotation': rot}
+
+    print(f"  Parsed {len(rest_data)} joints from {os.path.basename(filepath)}")
+    return rest_data
+
+
+def detect_mismatched_bones(armature, bone_order, normalize_mat, file_rest_locals):
+    """Compare Blender rest local quaternions vs file rest locals.
+    Returns set of joint indices (1-based) where dot product < MISMATCH_THRESHOLD.
+    """
+    arm_world = armature.matrix_world
+
+    # Ensure posed rest
+    if armature.animation_data:
+        armature.animation_data.action = None
+    armature.data.pose_position = 'POSE'
+    bpy.context.view_layer.update()
+
+    # Compute Blender's current rest locals
+    norm_world_mats = {}
+    for name in bone_order:
+        pb = armature.pose.bones[name]
+        bw = arm_world @ pb.matrix
+        bn = normalize_mat @ bw
+        loc, rot, _ = bn.decompose()
+        norm_world_mats[name] = Matrix.LocRotScale(loc, rot, Vector((1, 1, 1)))
+
+    mismatched = set()
+    for idx, name in enumerate(bone_order):
+        joint_idx = idx + 1
+        bone = armature.data.bones[name]
+
+        # Compute Blender rest local
+        bmat = norm_world_mats[name]
+        if bone.parent and bone.parent.name in bone_order:
+            local = norm_world_mats[bone.parent.name].inverted() @ bmat
+        else:
+            local = bmat
+        _, blender_rot, _ = local.decompose()
+
+        # File rest local
+        if joint_idx not in file_rest_locals:
+            continue
+        fr = file_rest_locals[joint_idx]['rotation']
+        file_rot = Quaternion((fr[0], fr[1], fr[2], fr[3]))  # WXYZ
+
+        dot = abs(blender_rot.dot(file_rot))
+        if dot < MISMATCH_THRESHOLD:
+            mismatched.add(joint_idx)
+            print(f"    ⚠️ J{joint_idx}({name}): dot={dot:.3f} → MISMATCHED")
+
+    print(f"  Mismatched bones: {len(mismatched)}/{len(bone_order)}")
+    return mismatched
+
+
+def get_animated_bones(action):
+    """Return set of bone names that have actual keyframes in this action."""
+    animated = set()
+    for fc in action.fcurves:
+        if fc.data_path.startswith("pose.bones["):
+            parts = fc.data_path.split('"')
+            if len(parts) >= 2:
+                animated.add(parts[1])
+    return animated
+
+
+# ============================================================================
 # STEP 6: EXPORT ANIMATIONS (ABSOLUTE LOCAL TRANSFORMS)
 # ============================================================================
 
 def export_animations(armature, bone_order, normalize_mat):
-    """Sample all animations as ABSOLUTE local transforms. Never reset matrix_basis."""
+    """Sample all animations as ABSOLUTE local transforms. Never reset matrix_basis.
+
+    When RE_EXPORT_MODE is True, uses three-tier hybrid sampling:
+    - Non-keyed bones → exact file rest values
+    - Keyed + good match (dot ≥ 0.95) → world-space delta
+    - Keyed + mismatch (dot < 0.95) → matrix_basis delta
+    """
     arm_world = armature.matrix_world
     all_animations = {}
+
+    # --- RE-EXPORT: load file rest pose and detect mismatches ---
+    file_rest_locals = None
+    mismatched_bones = set()
+    if RE_EXPORT_MODE:
+        if not RE_EXPORT_REST_FILE:
+            raise RuntimeError("RE_EXPORT_MODE=True but RE_EXPORT_REST_FILE is not set!")
+        print(f"  RE-EXPORT MODE: loading rest pose from {os.path.basename(RE_EXPORT_REST_FILE)}")
+        file_rest_locals = parse_rest_pose_from_file(RE_EXPORT_REST_FILE)
+        mismatched_bones = detect_mismatched_bones(armature, bone_order, normalize_mat, file_rest_locals)
 
     # Compute posed-rest locals for static channel optimization
     if armature.animation_data:
@@ -494,6 +614,8 @@ def export_animations(armature, bone_order, normalize_mat):
         bmat = Matrix.LocRotScale(loc, rot, Vector((1, 1, 1)))
         norm_world_mats[name] = bmat
 
+    # Blender rest local matrices (for delta computation in re-export mode)
+    blender_rest_local_mats = {}
     for name in bone_order:
         bone = armature.data.bones[name]
         bmat = norm_world_mats[name]
@@ -502,10 +624,25 @@ def export_animations(armature, bone_order, normalize_mat):
         else:
             local = bmat
         loc, rot, _ = local.decompose()
+        blender_rest_local_mats[name] = local
         posed_rest_locals[name] = {
             'translation': [loc.x, loc.y, loc.z],
             'rotation': [rot.w, rot.x, rot.y, rot.z],
         }
+
+    # --- RE-EXPORT: capture rest matrix_basis for mismatched bones ---
+    rest_basis_map = {}
+    file_rest_local_mats = {}
+    if RE_EXPORT_MODE and file_rest_locals:
+        for idx, name in enumerate(bone_order):
+            joint_idx = idx + 1
+            pb = armature.pose.bones[name]
+            rest_basis_map[name] = pb.matrix_basis.copy()
+            if joint_idx in file_rest_locals:
+                fr = file_rest_locals[joint_idx]
+                t = Vector(fr['translation'])
+                r = Quaternion((fr['rotation'][0], fr['rotation'][1], fr['rotation'][2], fr['rotation'][3]))
+                file_rest_local_mats[name] = Matrix.LocRotScale(t, r, Vector((1, 1, 1)))
 
     # Find actions to export (skip non-armature actions)
     actions = []
@@ -526,9 +663,9 @@ def export_animations(armature, bone_order, normalize_mat):
             short_name = ANIM_NAME_MAP[action.name]
         else:
             # Auto-derive: "RobotArmature|Robot_Walking_RobotArmature" → "Walking"
-            parts = action.name.split('|')
-            if len(parts) > 1:
-                inner = parts[1]
+            name_parts = action.name.split('|')
+            if len(name_parts) > 1:
+                inner = name_parts[1]
                 # Remove prefix/suffix patterns
                 for prefix in [armature.name + '_', 'Robot_']:
                     if inner.startswith(prefix):
@@ -538,8 +675,15 @@ def export_animations(armature, bone_order, normalize_mat):
                         inner = inner[:-len(suffix)]
                 short_name = inner
             elif '_' in short_name:
-                # Try splitting on underscore
                 short_name = short_name.split('_')[1] if len(short_name.split('_')) > 1 else short_name
+
+        # --- RE-EXPORT: detect animated bones for this action ---
+        animated_bone_names = set()
+        animated_indices = set()
+        if RE_EXPORT_MODE:
+            animated_bone_names = get_animated_bones(action)
+            animated_indices = {i + 1 for i, b in enumerate(bone_order) if b in animated_bone_names}
+            print(f"    {short_name}: {len(animated_indices)} keyed bones")
 
         # Assign action, DO NOT reset matrix_basis
         armature.animation_data.action = action
@@ -553,33 +697,98 @@ def export_animations(armature, bone_order, normalize_mat):
             bpy.context.view_layer.update()
             times.append(round((frame - frame_start) / FPS, 4))
 
-            # Compute world matrices for all bones
-            frame_mats = {}
-            for name in bone_order:
-                pb = armature.pose.bones[name]
-                bw = arm_world @ pb.matrix
-                bn = normalize_mat @ bw
-                loc, rot, _ = bn.decompose()
-                frame_mats[name] = Matrix.LocRotScale(loc, rot, Vector((1, 1, 1)))
+            if RE_EXPORT_MODE and file_rest_locals:
+                # --- RE-EXPORT: Three-tier hybrid sampling ---
+                for bi, name in enumerate(bone_order):
+                    joint_idx = bi + 1
+                    pb = armature.pose.bones[name]
 
-            # Compute local transforms
-            for name in bone_order:
-                bone = armature.data.bones[name]
-                bmat = frame_mats[name]
-                if bone.parent and bone.parent.name in bone_order:
-                    local = frame_mats[bone.parent.name].inverted() @ bmat
+                    if joint_idx not in animated_indices:
+                        # Tier 1: NOT keyed → exact file rest values
+                        fr = file_rest_locals[joint_idx]
+                        bone_samples[name]['translation'].append(
+                            [round(fr['translation'][0], 4),
+                             round(fr['translation'][1], 4),
+                             round(fr['translation'][2], 4)]
+                        )
+                        bone_samples[name]['rotation'].append(
+                            [round(fr['rotation'][0], 6),
+                             round(fr['rotation'][1], 6),
+                             round(fr['rotation'][2], 6),
+                             round(fr['rotation'][3], 6)]
+                        )
+                    elif joint_idx in mismatched_bones:
+                        # Tier 3: Keyed + MISMATCHED → matrix_basis delta
+                        rest_basis = rest_basis_map[name]
+                        frame_basis = pb.matrix_basis.copy()
+                        delta_basis = rest_basis.inverted() @ frame_basis
+                        corrected = file_rest_local_mats[name] @ delta_basis
+                        loc, rot, _ = corrected.decompose()
+                        bone_samples[name]['translation'].append(vec3_list(loc))
+                        bone_samples[name]['rotation'].append(quat_wxyz(rot))
+                    else:
+                        # Tier 2: Keyed + GOOD MATCH → world-space delta
+                        # Compute current animation local
+                        bw = arm_world @ pb.matrix
+                        bn = normalize_mat @ bw
+                        loc_w, rot_w, _ = bn.decompose()
+                        anim_world = Matrix.LocRotScale(loc_w, rot_w, Vector((1, 1, 1)))
+
+                        bone = armature.data.bones[name]
+                        if bone.parent and bone.parent.name in bone_order:
+                            parent_pb = armature.pose.bones[bone.parent.name]
+                            pw = arm_world @ parent_pb.matrix
+                            pn = normalize_mat @ pw
+                            pl, pr, _ = pn.decompose()
+                            parent_mat = Matrix.LocRotScale(pl, pr, Vector((1, 1, 1)))
+                            anim_local = parent_mat.inverted() @ anim_world
+                        else:
+                            anim_local = anim_world
+
+                        delta = blender_rest_local_mats[name].inverted() @ anim_local
+                        corrected = file_rest_local_mats[name] @ delta
+                        loc, rot, _ = corrected.decompose()
+                        bone_samples[name]['translation'].append(vec3_list(loc))
+                        bone_samples[name]['rotation'].append(quat_wxyz(rot))
+            else:
+                # --- STANDARD MODE: Sample absolute local transforms ---
+                frame_mats = {}
+                for name in bone_order:
+                    pb = armature.pose.bones[name]
+                    bw = arm_world @ pb.matrix
+                    bn = normalize_mat @ bw
+                    loc, rot, _ = bn.decompose()
+                    frame_mats[name] = Matrix.LocRotScale(loc, rot, Vector((1, 1, 1)))
+
+                for name in bone_order:
+                    bone = armature.data.bones[name]
+                    bmat = frame_mats[name]
+                    if bone.parent and bone.parent.name in bone_order:
+                        local = frame_mats[bone.parent.name].inverted() @ bmat
+                    else:
+                        local = bmat
+
+                    loc, rot, _ = local.decompose()
+                    bone_samples[name]['translation'].append(vec3_list(loc))
+                    bone_samples[name]['rotation'].append(quat_wxyz(rot))
+
+        # Optimize channels (same logic for both modes)
+        # In RE-EXPORT mode, compare against FILE rest locals
+        ref_rest = {}
+        if RE_EXPORT_MODE and file_rest_locals:
+            for bi, name in enumerate(bone_order):
+                joint_idx = bi + 1
+                if joint_idx in file_rest_locals:
+                    ref_rest[name] = file_rest_locals[joint_idx]
                 else:
-                    local = bmat
+                    ref_rest[name] = posed_rest_locals[name]
+        else:
+            ref_rest = posed_rest_locals
 
-                loc, rot, _ = local.decompose()
-                bone_samples[name]['translation'].append(vec3_list(loc))
-                bone_samples[name]['rotation'].append(quat_wxyz(rot))
-
-        # Optimize channels
         channels = []
         for bi, name in enumerate(bone_order):
             joint_idx = bi + 1
-            rest = posed_rest_locals[name]
+            rest = ref_rest[name]
 
             for path in ['translation', 'rotation']:
                 samples = bone_samples[name][path]
@@ -593,7 +802,7 @@ def export_animations(armature, bone_order, normalize_mat):
                 )
 
                 if is_constant:
-                    # Check if matches posed rest
+                    # Check if matches rest
                     matches_rest = all(abs(ref[k] - rest_vals[k]) < EPSILON for k in range(len(ref)))
                     if matches_rest:
                         continue  # Skip — sampleAnimation resets to rest
@@ -681,7 +890,7 @@ def write_part_file(filepath, var_name, part, skeleton_data=None, bone_order=Non
     lines = []
     lines.append("--!strict")
     lines.append(f"-- {os.path.basename(filepath)}")
-    lines.append(f"-- Auto-generated by blender_to_rive.py v5.0")
+    lines.append(f"-- Auto-generated by blender_to_rive.py v5.1")
     lines.append(f"-- Vertices: {len(part['vertices'])}, Faces: {len(part['faces'])}")
     lines.append("")
     lines.append(f"local {var_name} = {{}}")
@@ -758,7 +967,7 @@ def write_anim_file(filepath, var_name, anim_names, all_animations):
     lines = []
     lines.append("--!strict")
     lines.append(f"-- {os.path.basename(filepath)}")
-    lines.append(f"-- Auto-generated by blender_to_rive.py v5.0")
+    lines.append(f"-- Auto-generated by blender_to_rive.py v5.1")
     lines.append(f"-- Animations: {', '.join(anim_names)}")
     lines.append("")
     lines.append(f"local {var_name} = {{}}")
@@ -801,7 +1010,7 @@ def write_anim_file(filepath, var_name, anim_names, all_animations):
 def main():
     print("\n" + "=" * 70)
     print("  BLENDER TO RIVE — Universal 3D Export v5.0")
-    print("  (Multi-Mesh + Posed Rest + Verified + Separate Anim Files)")
+    print("  (Multi-Mesh + Posed Rest + Verified + Re-Export Mode)")
     print("=" * 70)
 
     # Step 0: Discover model
@@ -855,8 +1064,8 @@ def main():
     # Part files
     for i, part in enumerate(parts):
         suffix = chr(ord('A') + i)
-        var_name = f"{MODEL_NAME}Part{suffix}Data" if len(parts) > 1 else f"{MODEL_NAME}Data"
-        filename = f"{MODEL_NAME}Part{suffix}Data.luau"
+        var_name = f"{MODEL_NAME}Part{suffix}" if len(parts) > 1 else f"{MODEL_NAME}"
+        filename = f"{MODEL_NAME}Part{suffix}.luau"
         filepath = os.path.join(OUTPUT_DIR, filename)
         skel = skeleton_data if i == 0 else None
         bo = bone_order if i == 0 else None
@@ -873,8 +1082,8 @@ def main():
 
     for gi, group in enumerate(anim_groups):
         num = gi + 1
-        var_name = f"{MODEL_NAME}Anim{num}Data"
-        filename = f"{MODEL_NAME}Anim{num}Data.luau"
+        var_name = f"{MODEL_NAME}Anim{num}"
+        filename = f"{MODEL_NAME}Anim{num}.luau"
         filepath = os.path.join(OUTPUT_DIR, filename)
         write_anim_file(filepath, var_name, group, all_animations)
 
