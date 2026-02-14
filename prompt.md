@@ -1,37 +1,171 @@
-# Blender to Rive 3D Animation - AI Agent Prompt
+# Blender to Rive 3D Export — AI Agent Prompt
 
-> **For Claude Code with Blender MCP**: This prompt enables AI-assisted conversion of Blender 3D models to Rive-compatible Luau code.
+> **For Claude Code with Blender MCP**: Universal conversion of ANY Blender 3D model to Rive-compatible Luau code.
 
 ---
 
 ## ⚠️ STOP! Before You Start
 
-**Read these 11 rules or face hours of debugging:**
+**Read these 14 rules or face hours of debugging:**
 
-1. **DON'T require Mesh3DUtil for static models** - Inline the math functions
-2. **USE `c=index` format** - NOT RGB colors (60% file size reduction)
-3. **SORT faces by avgZ** - At export time, then table.sort at runtime
-4. **STORE `context`** - Required for `markNeedsUpdate()` (auto-rotation)
-5. **BLENDER Z-UP**: Yaw = XY rotation, NOT Y-axis rotation
-6. **FACTORIZE SKINNING** - Use patterns table + index array (~40% smaller files)
-7. **USE ANTI-FLICKERING METHOD** - table.sort + index tiebreaker + Z_EPSILON (0.001)
-8. **USE `depthBias`** - On processFaces: 0/10/20 for object-based parts, 0 for Z-sliced parts, 99/100 for wall overlays
-9. **ProjectedFace needs `index` field** - For stable sort tiebreaker
-10. **WALL-MOUNTED SURFACES** - Remove from Blender, hardcode in Node Script, use depthBias=100
-11. **ANIMATIONS = ABSOLUTE transforms** - NOT deltas from rest pose. Export final local TRS per keyframe.
+1. **⚠️ ALWAYS use "posed rest" as reference** — NOT `bone.matrix_local` (pure REST). See rule 12.
+2. **⚠️ NEVER reset `matrix_basis`** before sampling animations. It IS the model's default pose.
+3. **⚠️ ALWAYS prefer Blender MCP** over standalone Python scripts — more reliable.
+4. **DON'T require Mesh3DUtil for static models** — Inline the math functions
+5. **USE `c=index` format** — NOT RGB colors (60% file size reduction)
+6. **SORT faces by avgZ** — At export time, then table.sort at runtime
+7. **STORE `context`** — Required for `markNeedsUpdate()` (auto-rotation)
+8. **BLENDER Z-UP**: Yaw = XY rotation, NOT Y-axis rotation
+9. **FACTORIZE SKINNING** — Use patterns table + index array (~40% smaller files)
+10. **USE ANTI-FLICKERING** — table.sort + index tiebreaker + Z_EPSILON (0.001)
+11. **USE `depthBias`** — 0/10/20 for object-based parts, 0 for Z-sliced parts, 99/100 for wall overlays
+12. **⚠️ "POSED REST" = no action + pose_position='POSE'** — The default appearance WITH `matrix_basis`. Skeleton IBMs, vertices, AND animations must ALL use this same reference. `bone.matrix_local` for IBMs but `pose_bone.matrix` for animations causes massive offsets!
+13. **Static channel optimization: compare against POSED REST** — NOT just frame-to-frame constancy. Keep constant-but-different-from-posed-rest as 2-keyframe channels.
+14. **ANIMATIONS = ABSOLUTE transforms** — NOT deltas from rest pose. Export final local TRS per keyframe.
 
 ---
 
 ## Your Task
 
-Convert Blender 3D models into functional Rive Node Script Luau code with:
-- Automatic polygon-based fragmentation (>1900 faces per file with indexed colors)
-- Skeletal animation support (if Armature present)
-- Material-to-color category conversion (multi-zone coloring)
-- Vertex index optimization per fragment
-- **Factorized skinning data** (patterns + index array)
-- **Anti-flickering system**: table.sort + index tiebreaker + depthBias
-- **Wall-mounted surfaces**: hardcoded in Node Script + depthBias for guaranteed draw order
+Convert ANY Blender 3D model into functional Rive Node Script Luau code with:
+- **Multi-mesh support**: Any number of mesh objects linked to one armature
+- **Two skinning modes**: BONE-parented (rigid) AND armature-modifier (multi-bone weights)
+- **Automatic triangulation**: via bmesh (non-destructive, preserves original)
+- **Polygon-based fragmentation**: ~1900 faces per file with indexed colors
+- **Skeletal animation**: Any number of bones, any number of animations
+- **Material-to-color categories**: Multi-zone coloring (sorted alphabetically)
+- **Vertex optimization**: Only used vertices per fragment
+- **Factorized skinning**: Patterns table + index array
+- **Anti-flickering**: table.sort + index tiebreaker + depthBias
+- **Wall-mounted surfaces**: Hardcoded in Node Script + depthBias
+- **Verification**: Skin matrices = Identity + skinned vertices roundtrip
+
+---
+
+## Universal 10-Step Export Process
+
+### Step 1: Discover Model
+```python
+# Auto-detect:
+# - Armature (first ARMATURE object, or by name)
+# - All MESH children (exclude cameras, empties, helpers)
+# - Parent type: BONE (rigid) vs ARMATURE modifier (multi-bone)
+# - Materials across all meshes (sorted alphabetically → c=1..N)
+# - Total vertex/polygon count
+```
+
+### Step 2: Detect `matrix_basis` Residuals
+```python
+armature.animation_data.action = None
+armature.data.pose_position = 'POSE'
+bpy.context.view_layer.update()
+
+for pb in armature.pose.bones:
+    loc, rot, _ = pb.matrix_basis.decompose()
+    if loc.length > 0.0001 or abs(rot.w - 1) + abs(rot.x) + abs(rot.y) + abs(rot.z) > 0.001:
+        print(f"⚠️ {pb.name} has residual matrix_basis → MUST use posed rest")
+```
+
+### Step 3: Build Bone Order
+```python
+# DFS from root bones (sorted alphabetically), consistent ordering for:
+# joint indices, parent arrays, IBMs, rest pose, animation channels
+bone_order = []
+def dfs(bone):
+    bone_order.append(bone.name)
+    for child in sorted(bone.children, key=lambda b: b.name):
+        dfs(child)
+for root in sorted(armature.data.bones, key=lambda b: b.name):
+    if root.parent is None:
+        dfs(root)
+```
+
+### Step 4: Compute Normalization (POSED REST)
+```python
+# Bounding box from ALL meshes in POSED REST position
+# normalize_mat = Scale(TARGET_SIZE / max_dim) @ Translate(-center)
+# TARGET_SIZE = 200 (standard)
+```
+
+### Step 5: Export Skeleton (POSED REST)
+```python
+# Use pose_bone.matrix (NOT bone.matrix_local!)
+bone_world = arm_world @ pose_bone.matrix  # Includes matrix_basis ✓
+bone_norm = normalize_mat @ bone_world
+loc, rot, _ = bone_norm.decompose()
+bone_mat = LocRotScale(loc, rot, (1,1,1))  # Force scale=1
+ibm = bone_mat.inverted()
+# Rest pose local transform = parent_mat.inv @ bone_mat
+```
+
+### Step 6: Export Meshes
+```python
+# Per mesh object:
+# 1. Triangulate via bmesh (non-destructive temp copy)
+# 2. Transform vertices: normalize_mat @ obj.matrix_world @ v.co
+# 3. Map faces → material category index
+# 4. Skinning:
+#    - BONE parent → rigid (all verts → parent bone)
+#    - ARMATURE modifier → vertex groups (up to 4 bones, weights normalized)
+```
+
+### Step 7: Sort & Fragment
+```python
+# Sort ALL faces by avgZ (painter's algorithm)
+# Split into ~1900-face parts
+# Each part: only used vertices (remapped 1-based), own skinning data
+```
+
+### Step 8: Export Animations
+```python
+# DO NOT reset matrix_basis!
+# Sample ABSOLUTE local transforms per frame per bone
+# Store: translation {x,y,z}, rotation {w,x,y,z} (WXYZ)
+```
+
+### Step 9: Optimize Channels
+```python
+# Per bone per path:
+# - Constant AND matches posed-rest → REMOVE
+# - Constant but DIFFERS from posed-rest → 2-keyframe
+# - Varies → full channel
+```
+
+### Step 10: Verify & Write
+```python
+# MANDATORY: skin matrices = Identity at posed rest (< 0.001)
+# Write: Part files (skeleton in first) + Animation files (separate)
+```
+
+---
+
+## Animation System
+
+### Data Format
+**All data in SAME normalized coordinate space (~200 units max):**
+- **Quaternions:** WXYZ in files (Blender native). `SkeletalAnimUtil` converts to XYZW internally.
+- **Joint indices:** 1-based in files (Luau arrays).
+- **Skinning patterns:** 0-based bone indices. Runtime adds `+1`.
+- **Transforms:** ABSOLUTE (not deltas).
+
+### Runtime Pipeline
+```
+sampleAnimation()  →  writes absolute local transforms
+updateSkeleton()   →  computes worldMatrices + skinMatrices
+skinVerticesFact() →  transforms vertices by bone skinMatrix
+```
+
+### Static Channel Optimization (CRITICAL)
+```python
+EPSILON = 0.0001
+if is_constant_across_frames:
+    if matches_posed_rest(epsilon=EPSILON):
+        pass  # REMOVE — sampleAnimation resets to rest = posed-rest
+    else:
+        keep_as_2_keyframe(times=[0, duration])  # KEEP — differs from default
+else:
+    keep_full_channel()  # KEEP — values vary
+```
 
 ---
 
@@ -39,270 +173,112 @@ Convert Blender 3D models into functional Rive Node Script Luau code with:
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Max faces/file | **~1900** | Using `c=index` instead of RGB |
-| Max vertices/file | **~2500** | With vertex optimization per part |
+| Max faces/file | **~1900** | Using `c=index` |
+| Max vertices/file | **~2500** | With vertex optimization |
 
-**Key insight**: Using category index `c=1` instead of `color={r,g,b}` reduces file size by ~60%.
-
-**Factorized skinning** reduces file size by additional ~40% for animated models.
-
-**Animations** are stored in separate files from Part data (ModelAnim1Data, ModelAnim2Data, etc.).
+**Category index** (`c=1`) instead of RGB → ~60% smaller.
+**Factorized skinning** (patterns + index) → ~40% smaller.
+**Animations** in separate files from Part data.
 
 ---
 
-## Animation System (CRITICAL)
+## Multi-Mesh Support
 
-### Data Format
+| Mesh Parent Type | Skinning | Example |
+|-----------------|----------|---------|
+| **BONE parent** (rigid) | All verts → parent bone | Torso, head, limbs |
+| **ARMATURE modifier** | Vertex groups → up to 4 bones | Hands, flexible parts |
+| **No parent** | Excluded from export | Helpers, lights |
 
-**All data is in the SAME normalized coordinate space:**
-- **Vertices:** Centered, scaled to ~200 units max dimension
-- **IBMs:** Calculated in normalized space, scale forced to 1
-- **Rest pose:** Local transforms in normalized space, scale = `{1, 1, 1}`
-- **Animations:** **ABSOLUTE** local transforms per keyframe (NOT deltas)
-
-**Quaternion format:** WXYZ in data files (Blender native `{w, x, y, z}`).
-`SkeletalAnimUtil` converts to XYZW internally.
-
-**Joint indices:** 1-based in data files (Luau convention). No `+1` needed in `sampleAnimation()`.
-
-**Skinning patterns:** 0-based bone indices in patterns table. The `+1` is done in `skinVerticesFact()`.
-
-### Why ABSOLUTE (not deltas)
-
-The export script samples the full evaluated pose at each frame, computes local transform relative to parent (in normalized space), and stores that directly:
-- Each keyframe = final local TRS for that bone at that time
-- Runtime writes values directly to `localTransforms[jointIdx]`
-- No delta composition, no `matrix_basis`, no rest-pose multiplication
-- Avoids all FCurve delta interpretation complexity
-
-### Runtime Pipeline
-
-```
-sampleAnimation()  →  writes absolute local transforms
-updateSkeleton()   →  computes worldMatrices + skinMatrices
-skinVerticesFact() →  transforms vertices by bone skinMatrix
-```
-
-### Export Method (Blender MCP or blender_to_rive.py)
-
-```python
-# For each frame, for each bone:
-bpy.context.scene.frame_set(frame)
-pose_world = arm_world @ pose_bone.matrix
-pose_normalized = normalize_mat @ pose_world
-loc, rot, _ = pose_normalized.decompose()
-pose_mat = LocRotScale(loc, rot, (1,1,1))  # Force scale=1
-local_mat = parent_mat.inv @ pose_mat       # This IS the final local transform
-# Store as: translation={x,y,z}, rotation={w,x,y,z} (WXYZ)
-```
+All meshes share ONE skeleton, ONE normalization. Vertices merged, faces Z-sorted across all meshes before fragmenting.
 
 ---
 
-## Prerequisites
+## Anti-Flickering (3 Techniques)
 
-### Required MCP Tools
-- **Blender MCP** - For direct Blender scene access
+### 1. ProjectedFace with Index
+```luau
+export type ProjectedFace = {
+    path: Path, depth: number, color: Color,
+    index: number,  -- Stable sort tiebreaker
+}
+```
 
-### Reference Files
-- **CLAUDE.md** - Complete Rive Luau documentation
-- **Mesh3DUtil.luau** - 3D math utilities
-- **SkeletalAnimUtil.luau** - Skeletal animation system
-- **blender_to_rive.py** - Standalone export script (alternative to MCP)
+### 2. depthBias on processFaces
+```luau
+-- Z-sliced parts → depthBias = 0 for all
+-- Separate objects → depthBias = 0, 10, 20
+-- Wall overlay → depthBias = 99, 100
+```
+
+### 3. Stable Sort
+```luau
+local Z_EPSILON = 0.001
+table.sort(faces, function(a: ProjectedFace, b: ProjectedFace): boolean
+    local d = a.depth - b.depth
+    if math.abs(d) < Z_EPSILON then return a.index < b.index end
+    return a.depth < b.depth
+end)
+```
 
 ---
 
 ## Multi-Zone Coloring
 
-### Setup in Blender
-1. Create one material per color zone (e.g., M_Body, M_Head, M_Jaw, M_Ears, etc.)
-2. Assign materials to faces via vertex groups or manual selection
-3. Export — each material becomes a category index `c=1..N`
+1. Blender: one material per zone
+2. Export: each material → `c=1..N` (sorted alphabetically)
+3. Node Script: `Input<Color>` per zone + `colorMap` lookup
 
-### Implementation in Node Script
 ```luau
--- Expose colors in Property Group
-bodyColor: Input<Color>,
-headColor: Input<Color>,
-jawColor: Input<Color>,
-earColor: Input<Color>,
-frontLegColor: Input<Color>,
-hindLegColor: Input<Color>,
-tailColor: Input<Color>,
-
--- Build colorMap in processFaces
 local colorMap: { [number]: Color } = {
     [1] = self.bodyColor,
     [2] = self.headColor,
-    [3] = self.jawColor,
-    [4] = self.earColor,
-    [5] = self.frontLegColor,
-    [6] = self.hindLegColor,
-    [7] = self.tailColor,
+    [3] = self.armsColor,
 }
 local faceColor = colorMap[face.c] or self.bodyColor
 ```
 
 ---
 
-## Anti-Flickering System (CRITICAL - 3 Techniques Combined)
+## Wall-Mounted Surfaces
 
-### Problem
-Faces with nearly equal depth cause z-fighting flickering during rotation, especially between Parts from different files.
-
-### Solution: 3 Techniques Combined
-
-#### 1. ProjectedFace Type with Index
-```luau
-export type ProjectedFace = {
-    path: Path,
-    depth: number,
-    color: Color,
-    index: number,  -- Original insertion index for stable sort tiebreaker
-}
-```
-
-#### 2. depthBias on processFaces
-```luau
-local function processFaces(
-    self: Model3D,
-    vertices: { { x: number, y: number, z: number } },
-    faces: { { verts: { number }, c: number } },
-    -- ... other parameters ...
-    depthBias: number?  -- Shifts depth for sort order without moving geometry
-)
-    local bias = depthBias or 0
-    local avgZ = (sumZ / #transformed) + bias
-
-    table.insert(self.projectedFaces, {
-        path = facePath,
-        depth = avgZ,
-        color = litColor,
-        index = #self.projectedFaces + 1,
-    })
-end
-```
-
-**Usage depends on how parts are split:**
+1. Remove surface from Blender mesh
+2. Hardcode vertices/faces in Node Script (`advance()`)
+3. Position 1-2 units from wall + `depthBias=99/100`
 
 ```luau
--- Case A: Parts = separate objects (robot body/head) → large bias
-processFaces(self, vertsA, facesA, ..., 0)
-processFaces(self, vertsB, facesB, ..., 10)
-processFaces(self, vertsC, facesC, ..., 20)
-
--- Case B: Parts = Z-sorted slices of mixed objects → no bias
-processFaces(self, vertsA, facesA, ...)
-processFaces(self, vertsB, facesB, ...)
-
--- Case C: Wall-mounted overlay → force to front
-processFaces(self, screenVerts, screenFaces, ..., 100)
-```
-
-#### 3. Stable Sort with table.sort
-```luau
-local Z_EPSILON = 0.001
-table.sort(faces, function(a: ProjectedFace, b: ProjectedFace): boolean
-    local depthDiff = a.depth - b.depth
-    if math.abs(depthDiff) < Z_EPSILON then
-        return a.index < b.index
-    end
-    return a.depth < b.depth
-end)
-```
-
-### Recommended Values (Tested)
-| Parameter | Value | When |
-|-----------|-------|------|
-| Z_EPSILON | 0.001 | Always |
-| depthBias (separate objects) | 0, 10, 20 | Parts = distinct mesh objects |
-| depthBias (Z-sliced parts) | 0 for all | Parts = mixed objects sorted by avgZ |
-| depthBias (wall overlay) | 99, 100 | Surfaces that must draw on top of wall |
-| faceExpansion | 0.05 | Always |
-| brightness | 50 | Always |
-
----
-
-## Wall-Mounted Surfaces (Screens, Panels, Signs)
-
-**Problem:** Flat surfaces on walls Z-fight at rotation angles. Geometric offsets either fail or cause visible detachment.
-
-**Solution:**
-1. Remove the surface mesh from Blender
-2. Re-export Part files without it
-3. Hardcode vertices/faces directly in the Node Script (`advance()`)
-4. Position close to wall (1-2 normalized units from wall surface)
-5. Use `depthBias=99/100` to force draw order
-
-```luau
-local screenVerts: { { x: number, y: number, z: number } } = {
-    {x=-51, y=48.66, z=-8.82},
-    {x=-51, y=83.91, z=-8.82},
-    {x=-51, y=83.91, z=17.61},
-    {x=-51, y=48.66, z=17.61},
-}
-local screenFaces: { { verts: { number }, c: number } } = {
-    {verts = {1, 2, 3}, c = 12},
-    {verts = {1, 3, 4}, c = 12},
-}
 processFaces(self, screenVerts, screenFaces, ..., 100)
 ```
 
 ---
 
-## Skinning Data Format (CRITICAL for Animated Models)
+## Factorized Skinning
 
-### ❌ OLD Format (causes typecheck errors on large models)
 ```luau
-ModelData.skinning = {
-  {j = {1, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},
-  {j = {1, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},  -- Repeated 100s of times!
-}
-```
-
-### ✅ NEW Factorized Format
-```luau
+-- Patterns: one entry per unique weight combination
 local S = {
-  [0] = {j = {0, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},  -- Root
-  [1] = {j = {1, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},  -- Head
-  [2] = {j = {2, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},  -- Shoulder.L
-  -- ... one per bone
+  [0] = {j = {0, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},
+  [1] = {j = {1, 0, 0, 0}, w = {1.0, 0.0, 0.0, 0.0}},
+  -- Multi-bone example:
+  [42] = {j = {9, 10, 11, 0}, w = {0.45, 0.35, 0.20, 0.0}},
 }
-
 ModelData.skinningPatterns = S
-ModelData.skinningIndex = {1, 1, 1, 6, 6, 2, 2, 9, 9, 5, 5, ...}
+ModelData.skinningIndex = {1, 1, 1, 6, 6, 2, ...}  -- Pattern index per vertex
 ```
 
-### Node Script Usage
+### Runtime Usage
 ```luau
-type SkinEntry = { j: { number }, w: { number } }
-
-local function skinVerticesFact(
-    skeleton: SkelAnim.Skeleton,
-    vertices: { { x: number, y: number, z: number } },
-    skinningPatterns: { [number]: SkinEntry },
-    skinningIndex: { number }
-): { { x: number, y: number, z: number } }
-    local result = {}
+local function skinVerticesFact(skeleton, vertices, skinningPatterns, skinningIndex)
     for i, v in ipairs(vertices) do
-        local skinIdx = skinningIndex[i]
-        local skin = skinningPatterns[skinIdx]
-        local sx, sy, sz = 0.0, 0.0, 0.0
+        local skin = skinningPatterns[skinningIndex[i]]
         for k = 1, 4 do
             local jointIdx = skin.j[k] + 1  -- 0-based → 1-based
             local weight = skin.w[k]
-            if weight > 0 and jointIdx >= 1 then
-                local skinMat = skeleton.skinMatrices[jointIdx]
-                if skinMat then
-                    local tx, ty, tz = M.mat4TransformPoint(skinMat, v.x, v.y, v.z)
-                    sx = sx + tx * weight
-                    sy = sy + ty * weight
-                    sz = sz + tz * weight
-                end
+            if weight > 0 then
+                -- Transform vertex by skinMatrix[jointIdx]
             end
         end
-        table.insert(result, { x = sx, y = sy, z = sz })
     end
-    return result
 end
 ```
 
@@ -310,72 +286,41 @@ end
 
 ## Coordinate System (Blender Z-up)
 
-For Blender Z-up models, rotation mapping:
-- `rotationY` (Yaw) → Rotate in XY plane (horizontal turntable)
+- `rotationY` (Yaw) → Rotate in XY plane (turntable)
 - `rotationX` (Pitch) → Tilt forward/back
 - `rotationZ` (Roll) → Tilt left/right
 
 ```luau
-local function transformVertex(vx, vy, vz, ax, ay, az, cosX, sinX, cosY, sinY, cosZ, sinZ)
-    local x, y, z = vx - ax, vy - ay, vz - az
-    -- Yaw: rotate in XY plane
-    local rx = x * cosY - y * sinY
-    local ry = x * sinY + y * cosY
-    x, y = rx, ry
-    -- Pitch: rotate in YZ plane
-    local ry2 = y * cosX - z * sinX
-    local rz = y * sinX + z * cosX
-    y, z = ry2, rz
-    -- Roll: rotate in XY plane
-    local rx2 = x * cosZ - y * sinZ
-    local ry2b = x * sinZ + y * cosZ
-    return rx2, ry2b, z
-end
+-- Yaw: x,y rotation (cosY/sinY)
+-- Pitch: y,z rotation (cosX/sinX)
+-- Roll: x,y rotation (cosZ/sinZ)
 ```
 
 ---
 
 ## Rive Luau Restrictions
 
-### 1. table.sort with Typed Comparator (WORKS!)
+### table.sort MUST Have Type Annotations
 ```luau
 table.sort(faces, function(a: ProjectedFace, b: ProjectedFace): boolean
-    local depthDiff = a.depth - b.depth
-    if math.abs(depthDiff) < Z_EPSILON then
-        return a.index < b.index
-    end
     return a.depth < b.depth
 end)
 ```
-**Note:** The comparator MUST have type annotations (`: ProjectedFace`) and return type (`: boolean`).
 
-### 2. Type Casting for Untyped Data
+### Type Casting for Untyped Data
 ```luau
--- ❌ WRONG
-local clip = PartAData.animations["swim"]
-
--- ✅ CORRECT
 local animations = (PartAData :: any).animations :: { [string]: SkelAnim.AnimationClip }?
-if animations then
-  local clip = animations["swim"]
-end
 ```
 
-### 3. Path Modification in draw() FORBIDDEN
+### Path Modification in draw() FORBIDDEN
 ```luau
--- ❌ WRONG: "Path was modified between draws"
-function draw(self, renderer)
-  self.path:reset()  -- ERROR!
-end
+-- Build paths in advance(), only draw in draw()
+```
 
--- ✅ CORRECT: Build paths in advance()
-function advance(self, seconds)
-  for _, face in ipairs(faces) do
-    local facePath = Path.new()
-    facePath:moveTo(...)
-    facePath:close()
-    table.insert(self.projectedFaces, { path = facePath, ... })
-  end
+### Auto-Rotation Requires markNeedsUpdate
+```luau
+if self.rotationSpeed ~= 0 and self.context then
+    self.context:markNeedsUpdate()
 end
 ```
 
@@ -385,17 +330,12 @@ end
 
 ### Part Data File
 ```luau
--- Skeleton (first part only)
-ModelData.skeleton = {
+ModelData.skeleton = {  -- First part only
   jointCount = N,
-  jointParents = { nil, 1, 2, ... },         -- 1-based, nil for roots
-  inverseBindMatrices = { {16 floats}, ... }, -- Column-major, scale=1
-  restPose = {
-    { translation = {x, y, z}, rotation = {w, x, y, z}, scale = {1, 1, 1} },
-    ...
-  },
+  jointParents = { nil, 1, 2, ... },
+  inverseBindMatrices = { {16 floats}, ... },
+  restPose = { { translation = {x,y,z}, rotation = {w,x,y,z}, scale = {1,1,1} }, ... },
 }
-
 ModelData.vertices = { {x=0, y=0, z=0}, ... }
 ModelData.faces = { {verts={1,2,3}, c=1}, ... }
 ModelData.skinningPatterns = S
@@ -405,22 +345,17 @@ ModelData.skinningIndex = {1, 1, 1, 6, 6, ...}
 ### Animation Data File
 ```luau
 ModelData.animations = {
-  ["idle_Root_00"] = {
-    name = "idle_Root_00",
-    duration = 1.5,
+  ["walk"] = {
+    name = "walk", duration = 1.5,
     channels = {
       { jointIndex = 1, path = "rotation", times = {...}, values = {w,x,y,z,...} },
       { jointIndex = 1, path = "translation", times = {...}, values = {x,y,z,...} },
-      ...
     },
   },
 }
 ```
 
-**Key format details:**
-- `jointIndex` is **1-based** (Luau arrays)
-- Rotation values are **WXYZ** (Blender native)
-- All transforms are **ABSOLUTE** (not deltas)
+**Key:** jointIndex = 1-based, rotation = WXYZ, transforms = ABSOLUTE.
 
 ---
 
@@ -428,103 +363,35 @@ ModelData.animations = {
 
 | Problem | Cause | Solution |
 |---------|-------|----------|
-| Faces flickering | Z-fighting from coplanar faces | Use 3-technique anti-flickering |
-| Flickering between Parts (objects) | Parts compete for same depth | Use depthBias 0, 10, 20 |
-| Flickering between Parts (Z-sliced) | Bias corrupts mixed Z-ordering | Use depthBias=0 for all parts |
-| Screen/panel flickers on wall | Coplanar with wall | Hardcode + depthBias=100 |
-| Screen detaches from wall | Geometric offset too large | Use small offset + large depthBias |
-| Model disappears when animated | Data format mismatch | Re-export with blender_to_rive.py |
-| Animation looks wrong | Using deltas instead of absolute | Ensure ABSOLUTE local transforms |
-| Quaternion issues | WXYZ vs XYZW confusion | Data=WXYZ, runtime converts to XYZW |
-| `localTransforms[0]` nil | 0-based jointIndex | Use 1-based jointIndex in data |
-| `{x=1}[1]` returns nil | Named keys vs arrays | Use ordered arrays in data files |
-| Model twisted when animated | Coordinate space mismatch | Use SAME normalize_mat for ALL data |
-| "Code too complex" / typecheck error | Too many skinning entries | Use factorized skinning format |
-| "Path modified between draws" | path:reset() in draw() | Build paths in advance() |
-| Model tilts instead of turns | Wrong rotation axis | Yaw = XY rotation for Z-up models |
-| rotationSpeed does nothing | Missing markNeedsUpdate | Store context, call markNeedsUpdate() |
+| **Body parts scattered/dislocated** | **Different reference poses** | **Posed rest for ALL exports** |
+| **Head/shoulders offset** | **Pure REST for IBMs, posed for anims** | **Use `pose_bone.matrix` everywhere** |
+| **Arms in T-pose / horizontal** | **`matrix_basis` reset or channels removed** | **Never reset; keep constant-but-different** |
+| **Huge offset on root** | **matrix_basis amplified by scale** | **Detect residuals first (Step 2)** |
+| **Bones snap to wrong pose** | **No keyframes + reset matrix_basis** | **Keep matrix_basis; use posed-rest** |
+| Faces flickering | Z-fighting | 3-technique anti-flickering |
+| Animation wrong | Deltas not absolute | ABSOLUTE local transforms |
+| Quaternion issues | WXYZ/XYZW mismatch | Data=WXYZ, runtime converts |
+| File too large | Repeated skinning | Factorized skinning |
+| Non-triangular faces | Quads/ngons | Triangulate via bmesh |
+| `StructRNA removed` | Freed evaluated mesh | Use temp mesh copy |
+| `rotationSpeed` broken | No markNeedsUpdate | Store context |
 
 ---
 
 ## Pre-Export Checklist
 
-Before running any export:
-
-- [ ] Analyzed model (vertex count, polygon count, materials)
-- [ ] Identified coordinate system (Z-up for Blender)
-- [ ] Mapped materials to category indices (one per zone)
-- [ ] Will use `c=index` format (NOT RGB)
-- [ ] Will sort faces by avgZ before fragmenting
-- [ ] Will extract only used vertices per part
-- [ ] **Will use factorized skinning** (patterns + index)
-- [ ] **Animations: ABSOLUTE local transforms** (not deltas)
-- [ ] **Quaternions: WXYZ in data files**
-- [ ] **Joint indices: 1-based in data files**
-- [ ] Main script will store `context` for `markNeedsUpdate()`
-- [ ] For Z-up: Yaw rotates in XY plane (cosY/sinY on x,y)
-- [ ] **Anti-flickering implemented:**
-  - [ ] ProjectedFace type has `index` field
-  - [ ] processFaces has optional `depthBias` parameter
-  - [ ] depthBias: 0 for Z-sliced parts, 0/10/20 for object-based parts
-  - [ ] table.sort with typed comparator + Z_EPSILON (0.001) + index tiebreaker
-  - [ ] faceExpansion = 0.05, brightness = 50
-- [ ] **Multi-zone coloring** (if applicable):
-  - [ ] Materials assigned in Blender (one per zone)
-  - [ ] Input<Color> per zone in Node Script
-  - [ ] colorMap in processFaces
-- [ ] **Wall-mounted surfaces** (if any):
-  - [ ] Removed from Blender, hardcoded in Node Script
-  - [ ] Positioned close to wall (1-2 normalized units)
-  - [ ] depthBias=99/100 to force draw order
-
----
-
-## Common Mistakes Summary
-
-| What You Did | What Went Wrong | What To Do |
-|--------------|-----------------|------------|
-| Used Mesh3DUtil for static model | Unnecessary import | Inline the math functions |
-| Used RGB `color={r,g,b}` | Files too large | Use `c=1` category index |
-| Used full skinning entries | Typecheck error / huge files | Use factorized skinning |
-| Exported FCurve deltas | Animation corrupted | Export ABSOLUTE local transforms |
-| Used 0-based jointIndex | Root bone never animated | Use 1-based jointIndex |
-| Used named keys `{x=,y=}` | `[1]` returns nil | Use ordered arrays `{v1, v2}` |
-| Sorted by maxZ | Objects behind terrain | Sort by avgZ (centroid) |
-| Forgot `context:markNeedsUpdate()` | rotationSpeed does nothing | Store context, call markNeedsUpdate |
-| Yaw rotated around Y axis | Model tilts instead of turns | For Z-up: rotate in XY plane |
-| Shared all vertices across parts | "Code too complex" error | Extract only used vertices per part |
-| Used geometric offset for wall screen | Screen detaches at rotation | Use depthBias=100 + small offset |
-| Used depthBias on Z-sliced parts | Objects appear behind walls | Use depthBias=0 for Z-sliced parts |
-| Tried to patch unknown data format | Hours of debugging | Re-export from Blender instead |
-
----
-
-## Auto-Rotation Implementation (CRITICAL)
-
-**Problem:** `rotationSpeed` does nothing without waking the render loop.
-
-```luau
-export type Model3D = {
-  context: Context?,  -- MUST store context reference
-  -- ...
-}
-
-local function init(self: Model3D, context: Context): boolean
-  self.context = context  -- Store it!
-  return true
-end
-
-local function advance(self: Model3D, seconds: number): boolean
-  if self.rotationSpeed ~= 0 then
-    self.autoAngleY = self.autoAngleY + self.rotationSpeed * seconds
-    if self.context then
-      self.context:markNeedsUpdate()  -- Wake render loop
-    end
-  end
-  -- Also wake for animation
-  if self.animationEnabled and self.context then
-    self.context:markNeedsUpdate()
-  end
-  return true
-end
-```
+- [ ] `matrix_basis` residuals detected (Step 2)
+- [ ] Model analyzed (meshes, bones, materials, parent types)
+- [ ] Normalization in POSED REST (all meshes)
+- [ ] Skeleton IBMs from posed rest (`pose_bone.matrix`)
+- [ ] Vertices in posed rest
+- [ ] Meshes triangulated (bmesh)
+- [ ] Animations WITHOUT resetting `matrix_basis`
+- [ ] Static channels vs POSED REST
+- [ ] Skin matrices = Identity verified (< 0.001)
+- [ ] Materials → category indices (alphabetical)
+- [ ] Faces Z-sorted → fragments → vertex optimization
+- [ ] Factorized skinning (patterns + index)
+- [ ] ABSOLUTE WXYZ transforms, 1-based joints
+- [ ] Anti-flickering + depthBias
+- [ ] `context:markNeedsUpdate()` for rotation/animation
