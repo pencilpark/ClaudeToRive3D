@@ -21,10 +21,11 @@ https://x.com/fredberria/status/2016568637310513207?s=20
    - [Method 1: Using Blender MCP (Recommended)](#method-1-using-blender-mcp-recommended)
    - [Method 2: Using Standalone Script](#method-2-using-standalone-script)
 5. [File Structure](#file-structure)
-6. [Configuration Reference](#configuration-reference)
-7. [Property Group Reference](#property-group-reference)
-8. [Troubleshooting](#troubleshooting)
-9. [Advanced Topics](#advanced-topics)
+6. [Data Format](#data-format)
+7. [Configuration Reference](#configuration-reference)
+8. [Property Group Reference](#property-group-reference)
+9. [Troubleshooting](#troubleshooting)
+10. [Advanced Topics](#advanced-topics)
 
 ---
 
@@ -38,10 +39,12 @@ This pipeline allows you to:
 
 **Key Features:**
 - Automatic mesh normalization (~200 units)
-- Automatic fragmentation for large meshes (>350 faces)
+- Automatic fragmentation for large meshes (~1900 faces per part)
 - Multiple animation support with runtime switching
 - Full skeletal animation with vertex skinning
 - Customizable material colors via Property Group
+- **Optimized flat array format** for vertices and faces (~33% file size reduction)
+- **Factorized skinning** (patterns + index, ~40% smaller)
 - **Blender MCP integration** for AI-assisted conversion
 
 ---
@@ -64,11 +67,14 @@ This pipeline allows you to:
 # 1. In Blender: Configure and run the export script
 # Edit MODEL_NAME in blender_to_rive.py, then run with Alt+P
 
-# 2. Copy generated files to your Rive project
+# 2. Optimize data files to flat arrays
+python3 convert_flat.py
 
-# 3. Create your main Node Script based on the example template
+# 3. Copy generated files to your Rive project
 
-# 4. In Rive: Set animationName Input to play animations
+# 4. Create your main Node Script based on the example template
+
+# 5. In Rive: Set animationName Input to play animations
 ```
 
 ---
@@ -82,6 +88,7 @@ This pipeline allows you to:
 
 ### For Standalone Script Method
 - **Blender 3.0+** (tested on 4.x)
+- **Python 3** (for `convert_flat.py` post-processing)
 - Model must have:
   - Armature (skeleton)
   - Vertex weights painted
@@ -129,7 +136,7 @@ Claude Code will:
 3. Extract skeleton hierarchy and IBMs
 4. Extract skinning weights
 5. Extract all animation clips
-6. Generate ready-to-use `.luau` files
+6. Generate ready-to-use `.luau` files with flat array format
 
 #### Step 4: Copy to Rive
 
@@ -154,7 +161,7 @@ Your model needs:
 
 ```
 1. Select the Armature
-2. Press Ctrl+A → Apply All Transforms
+2. Press Ctrl+A -> Apply All Transforms
 3. Verify in Properties panel: Scale = 1.000, 1.000, 1.000
 ```
 
@@ -175,8 +182,7 @@ Open `blender_to_rive.py` and edit:
 MODEL_NAME = "YourModel"       # Output file prefix
 TARGET_SIZE = 200.0            # Normalize to ~200 units
 OUTPUT_DIR = "//"              # Output directory
-MAX_FACES_PER_PART = 350       # Auto-fragment threshold
-MAX_VERTS_PER_PART = 500       # Auto-fragment threshold
+MAX_FACES_PER_PART = 1900     # Auto-fragment threshold
 ```
 
 #### Step 4: Run the Export
@@ -186,17 +192,18 @@ MAX_VERTS_PER_PART = 500       # Auto-fragment threshold
 3. **Select your Armature** (or Mesh)
 4. Press **Alt+P** to run
 
-#### Step 5: Copy to Rive
+#### Step 5: Optimize to Flat Arrays
 
-The script generates:
-```
-YourModel.blend (same folder)
-├── YourModelPartAData.luau
-├── YourModelPartBData.luau (if fragmented)
-└── ...
+```bash
+python3 convert_flat.py
 ```
 
-Copy these files to your Rive project along with:
+This converts vertices from `{x=N, y=N, z=N}` to flat `N, N, N,` and faces from `{verts={a,b,c}, c=N}` to flat `a, b, c, N,` — saving ~33% file size.
+
+#### Step 6: Copy to Rive
+
+Copy these files to your Rive project:
+- `YourModelPartAData.luau`, `YourModelPartBData.luau`, etc.
 - `Mesh3DUtil.luau`
 - `SkeletalAnimUtil.luau`
 
@@ -207,14 +214,78 @@ Copy these files to your Rive project along with:
 ```
 project/
 ├── blender_to_rive.py        # Standalone Blender export script
+├── convert_flat.py           # Convert data files to flat arrays (post-export)
 ├── prompt.md                 # AI prompt for Blender MCP workflow
 ├── Mesh3DUtil.luau           # 3D math (matrices, quaternions, projection)
 ├── SkeletalAnimUtil.luau     # Skeleton building, animation, skinning
-├── Example.luau              # Example: Main Node Script
-├── ExamplePartAData.luau     # Example: Generated data (part A)
-├── ExamplePartBData.luau     # Example: Generated data (part B)
+├── Model.luau                # Main Node Script (rendering + Property Group)
+├── ModelPartAData.luau       # Generated data: vertices, faces, skeleton, skinning
+├── ModelPartBData.luau       # Generated data: vertices, faces, skinning
+├── ModelAnim1Data.luau       # Generated data: animation clips
 ├── CLAUDE.md                 # Full technical documentation
 └── README.md                 # This file
+```
+
+---
+
+## Data Format
+
+### Flat Arrays (Optimized)
+
+Vertices and faces use **flat number arrays** for ~33% smaller file sizes:
+
+```luau
+-- Vertices: flat array, stride 3 (x, y, z per vertex)
+ModelData.vertices = {
+    10.825, -18.875, -1.141,
+    11.296, -19.324, 1.685,
+    -- ...
+}
+-- Access vertex i: base = (i - 1) * 3
+-- vx = vertices[base + 1], vy = vertices[base + 2], vz = vertices[base + 3]
+
+-- Faces: flat array, stride 4 (v1, v2, v3, category per face)
+ModelData.faces = {
+    4150, 4151, 4152, 1,
+    4151, 4150, 4153, 1,
+    -- ...
+}
+-- Access face fi (0-based): fBase = fi * 4
+-- vi1 = faces[fBase + 1], category = faces[fBase + 4]
+```
+
+### Skeleton & Skinning
+
+```luau
+ModelData.skeleton = {
+    jointCount = 13,
+    jointParents = { nil, 1, 2, 2, 1, ... },
+    inverseBindMatrices = { { 16 floats }, ... },
+    restPose = {
+        { translation = {x,y,z}, rotation = {w,x,y,z}, scale = {1,1,1} },
+        ...
+    },
+}
+
+-- Factorized skinning: patterns + per-vertex index
+ModelData.skinningPatterns = {
+    [0] = { j = {0,0,0,0}, w = {1.0,0,0,0} },
+    [1] = { j = {1,0,0,0}, w = {1.0,0,0,0} },
+    ...
+}
+ModelData.skinningIndex = { 1, 1, 1, 6, 6, 2, ... }  -- Per vertex
+```
+
+### Animations
+
+```luau
+ModelData.animations = {
+    ["Armature|Swim"] = {
+        name = "Armature|Swim",
+        duration = 4.21,
+        channels = { ... }
+    },
+}
 ```
 
 ---
@@ -228,45 +299,16 @@ project/
 | `MODEL_NAME` | "Model" | Output file prefix |
 | `TARGET_SIZE` | 200.0 | Normalize mesh to this size |
 | `OUTPUT_DIR` | "//" | Output directory (// = relative to .blend) |
-| `MAX_FACES_PER_PART` | 350 | Fragment threshold for faces |
-| `MAX_VERTS_PER_PART` | 500 | Fragment threshold for vertices |
+| `MAX_FACES_PER_PART` | 1900 | Fragment threshold for faces |
 
-### Generated Data Structure
+### convert_flat.py
 
-```luau
-ModelData.skeleton = {
-    jointCount = 13,
-    jointParents = { nil, 1, 2, 2, 1, ... },
-    inverseBindMatrices = { { 16 floats }, ... },
-    restPose = {
-        { translation = {x,y,z}, rotation = {w,x,y,z}, scale = {1,1,1} },
-        ...
-    },
-}
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `FILES` | (list) | Part data files to convert |
+| `BASE_DIR` | script dir | Directory containing .luau files |
 
-ModelData.skinning = {
-    { j = {0,1,2,0}, w = {0.8,0.1,0.1,0} },  -- per vertex
-    ...
-}
-
-ModelData.vertices = {
-    { x = 0, y = 0, z = 0 },
-    ...
-}
-
-ModelData.faces = {
-    { verts = {1,2,3}, c = 1 },  -- c = material category
-    ...
-}
-
-ModelData.animations = {
-    ["Armature|Swim"] = {
-        name = "Armature|Swim",
-        duration = 4.21,
-        channels = { ... }
-    },
-}
-```
+Edit the `FILES` list at the top of `convert_flat.py` to match your model's Part data files.
 
 ---
 
@@ -294,8 +336,8 @@ ModelData.animations = {
 ### Rendering
 | Input | Type | Default | Description |
 |-------|------|---------|-------------|
-| `brightness` | Number | 30 | Brightness (0-100, divided by 100) |
-| `faceExpansion` | Number | 0.005 | Expand faces to eliminate gaps |
+| `brightness` | Number | 50 | Brightness (0-100, divided by 100) |
+| `faceExpansion` | Number | 0.05 | Expand faces to eliminate gaps |
 | `backfaceCulling` | Boolean | true | Hide back-facing faces |
 | `wireframe` | Boolean | false | Wireframe mode |
 
@@ -314,11 +356,11 @@ ModelData.animations = {
 
 | Problem | Cause | Solution |
 |---------|-------|----------|
-| Model twisted when animated | Coordinate space mismatch | Re-export with `blender_to_rive.py` |
-| Model explodes during animation | Armature scale ≠ 1 | Apply transforms in Blender (Ctrl+A) |
-| Animation amplified/stretched | Scale baked into bones | Force scale=1 in export (automatic) |
+| Model twisted when animated | Coordinate space mismatch | Re-export with posed rest reference |
+| Model explodes during animation | Armature scale != 1 | Apply transforms in Blender (Ctrl+A) |
+| Body parts scattered | Different reference poses | Use posed rest for ALL exports |
 | Some faces missing | Wrong winding order | Check normals in Blender |
-| Z-fighting (flickering) | Faces at same depth | Increase `faceExpansion` |
+| Z-fighting (flickering) | Faces at same depth | Use anti-flickering (depthBias + Z_EPSILON) |
 
 ### Animation Issues
 
@@ -326,17 +368,17 @@ ModelData.animations = {
 |---------|-------|----------|
 | Animation doesn't play | Wrong animation name | Check console for available names |
 | Animation plays wrong | Multiple actions exported | Set correct `animationName` |
-| Jerky animation | Missing keyframes | Add more keyframes in Blender |
+| Arms in T-pose | `matrix_basis` reset | Never reset matrix_basis |
+| Body frozen in partial anim | Only some bones keyed | Use animation composition with Idle |
 | Animation too fast/slow | Wrong speed | Adjust `animationSpeed` Input |
 
 ### Script Issues
 
 | Problem | Cause | Solution |
 |---------|-------|----------|
-| "Code too complex to typecheck" | Too many vertices per part | Reduce `MAX_VERTS_PER_PART` |
+| "Code too complex to typecheck" | Too many vertices per part | Reduce MAX_FACES_PER_PART |
 | "Path was modified between draws" | `path:reset()` in `draw()` | Build paths in `advance()` only |
-| Type errors | Untyped data access | Cast through `:: any` then to type |
-| table.sort error | Inline comparator | Use manual bubble sort |
+| Type errors | Untyped data access | Cast through `:: any` then to `:: { number }` |
 
 ### Export Issues
 
@@ -345,6 +387,7 @@ ModelData.animations = {
 | No output files | Script error | Check Blender console for errors |
 | Missing animations | Actions not linked | Ensure actions are in Action Editor |
 | Wrong vertex count | Modifiers not applied | Apply modifiers before export |
+| File still large | Old table-of-tables format | Run `convert_flat.py` |
 
 ---
 
@@ -363,7 +406,7 @@ With Blender MCP, you can also:
 You can have multiple 3D models in the same Rive file:
 1. Export each model separately with different `MODEL_NAME`
 2. Create separate Node Scripts for each
-3. They share the same utility scripts
+3. They share the same utility scripts (`Mesh3DUtil.luau`, `SkeletalAnimUtil.luau`)
 
 ### Animation Blending
 
@@ -378,19 +421,21 @@ SkelAnim.blendAnimations(skeleton, clipA, clipB, timeA, timeB, blendFactor)
 
 For better performance:
 - Reduce polygon count in Blender (decimate modifier)
+- Use flat arrays (`convert_flat.py`) for ~33% smaller data files
+- Use `table.create(n, 0)` for pre-allocated flat arrays in skinning
 - Use orthographic projection (`usePerspective = false`)
-- Disable `backfaceCulling` only if needed
 - Keep `brightness` calculation simple
 
 ---
 
 ## Critical Rules Summary
 
-1. **Coordinate Space Consistency**: ALL data (vertices, IBMs, rest pose, animations) must use the SAME normalized space
+1. **Coordinate Space Consistency**: ALL data (vertices, IBMs, rest pose, animations) must use the SAME normalized space ("posed rest")
 2. **Scale = 1**: Always force scale to 1 on bone matrices
 3. **Quaternion Format**: Blender exports WXYZ, SkeletalAnimUtil converts to XYZW automatically
 4. **Animation Format**: Store FINAL local transforms, not deltas
-5. **Rive Restrictions**: No `table.sort` comparators, no `path:reset()` in `draw()`
+5. **Flat Arrays**: Vertices stride 3, faces stride 4 for optimal file size
+6. **Rive Restrictions**: Type annotations on `table.sort`, no `path:reset()` in `draw()`
 
 ---
 

@@ -4,25 +4,25 @@
 
 ---
 
-## ⚠️ STOP! Before You Start
+## STOP! Before You Start
 
-**Read these 14 rules or face hours of debugging:**
+**Read these 15 rules or face hours of debugging:**
 
-1. **⚠️ ALWAYS use "posed rest" as reference** — NOT `bone.matrix_local` (pure REST). See rule 12.
-2. **⚠️ NEVER reset `matrix_basis`** before sampling animations. It IS the model's default pose.
-3. **⚠️ ALWAYS prefer Blender MCP** over standalone Python scripts — more reliable.
+1. **ALWAYS use "posed rest" as reference** — NOT `bone.matrix_local` (pure REST). See rule 12.
+2. **NEVER reset `matrix_basis`** before sampling animations. It IS the model's default pose.
+3. **ALWAYS prefer Blender MCP** over standalone Python scripts — more reliable.
 4. **DON'T require Mesh3DUtil for static models** — Inline the math functions
-5. **USE `c=index` format** — NOT RGB colors (60% file size reduction)
+5. **USE flat arrays** for vertices (stride 3) and faces (stride 4) — ~33% smaller files
 6. **SORT faces by avgZ** — At export time, then table.sort at runtime
 7. **STORE `context`** — Required for `markNeedsUpdate()` (auto-rotation)
 8. **BLENDER Z-UP**: Yaw = XY rotation, NOT Y-axis rotation
 9. **FACTORIZE SKINNING** — Use patterns table + index array (~40% smaller files)
 10. **USE ANTI-FLICKERING** — table.sort + index tiebreaker + Z_EPSILON (0.001)
 11. **USE `depthBias`** — 0/10/20 for object-based parts, 0 for Z-sliced parts, 99/100 for wall overlays
-12. **⚠️ "POSED REST" = no action + pose_position='POSE'** — The default appearance WITH `matrix_basis`. Skeleton IBMs, vertices, AND animations must ALL use this same reference. `bone.matrix_local` for IBMs but `pose_bone.matrix` for animations causes massive offsets!
+12. **"POSED REST" = no action + pose_position='POSE'** — The default appearance WITH `matrix_basis`. Skeleton IBMs, vertices, AND animations must ALL use this same reference. `bone.matrix_local` for IBMs but `pose_bone.matrix` for animations causes massive offsets!
 13. **Static channel optimization: compare against POSED REST** — NOT just frame-to-frame constancy. Keep constant-but-different-from-posed-rest as 2-keyframe channels.
 14. **ANIMATIONS = ABSOLUTE transforms** — NOT deltas from rest pose. Export final local TRS per keyframe.
-15. **⚠️ RE-EXPORT TRAP: Quaternion sign ambiguity** — `decompose()` is NOT unique (`q` ≡ `-q`). When re-exporting animations in a new session, compare rest local quaternion dot product vs file. If dot < 0.95 → use `matrix_basis` delta. Non-keyed bones → exact file rest values. See Step 8b.
+15. **RE-EXPORT TRAP: Quaternion sign ambiguity** — `decompose()` is NOT unique (`q` = `-q`). When re-exporting animations in a new session, compare rest local quaternion dot product vs file. If dot < 0.95 -> use `matrix_basis` delta. Non-keyed bones -> exact file rest values. See Step 8b.
 
 ---
 
@@ -37,6 +37,7 @@ Convert ANY Blender 3D model into functional Rive Node Script Luau code with:
 - **Material-to-color categories**: Multi-zone coloring (sorted alphabetically)
 - **Vertex optimization**: Only used vertices per fragment
 - **Factorized skinning**: Patterns table + index array
+- **Flat array format**: Vertices (stride 3) and faces (stride 4) for ~33% file reduction
 - **Anti-flickering**: table.sort + index tiebreaker + depthBias
 - **Wall-mounted surfaces**: Hardcoded in Node Script + depthBias
 - **Verification**: Skin matrices = Identity + skinned vertices roundtrip
@@ -51,7 +52,7 @@ Convert ANY Blender 3D model into functional Rive Node Script Luau code with:
 # - Armature (first ARMATURE object, or by name)
 # - All MESH children (exclude cameras, empties, helpers)
 # - Parent type: BONE (rigid) vs ARMATURE modifier (multi-bone)
-# - Materials across all meshes (sorted alphabetically → c=1..N)
+# - Materials across all meshes (sorted alphabetically -> c=1..N)
 # - Total vertex/polygon count
 ```
 
@@ -64,7 +65,7 @@ bpy.context.view_layer.update()
 for pb in armature.pose.bones:
     loc, rot, _ = pb.matrix_basis.decompose()
     if loc.length > 0.0001 or abs(rot.w - 1) + abs(rot.x) + abs(rot.y) + abs(rot.z) > 0.001:
-        print(f"⚠️ {pb.name} has residual matrix_basis → MUST use posed rest")
+        print(f"  {pb.name} has residual matrix_basis -> MUST use posed rest")
 ```
 
 ### Step 3: Build Bone Order
@@ -91,7 +92,7 @@ for root in sorted(armature.data.bones, key=lambda b: b.name):
 ### Step 5: Export Skeleton (POSED REST)
 ```python
 # Use pose_bone.matrix (NOT bone.matrix_local!)
-bone_world = arm_world @ pose_bone.matrix  # Includes matrix_basis ✓
+bone_world = arm_world @ pose_bone.matrix  # Includes matrix_basis
 bone_norm = normalize_mat @ bone_world
 loc, rot, _ = bone_norm.decompose()
 bone_mat = LocRotScale(loc, rot, (1,1,1))  # Force scale=1
@@ -104,10 +105,11 @@ ibm = bone_mat.inverted()
 # Per mesh object:
 # 1. Triangulate via bmesh (non-destructive temp copy)
 # 2. Transform vertices: normalize_mat @ obj.matrix_world @ v.co
-# 3. Map faces → material category index
-# 4. Skinning:
-#    - BONE parent → rigid (all verts → parent bone)
-#    - ARMATURE modifier → vertex groups (up to 4 bones, weights normalized)
+# 3. Store as flat arrays: x, y, z, x, y, z, ... (stride 3)
+# 4. Map faces -> flat arrays: v1, v2, v3, category, ... (stride 4)
+# 5. Skinning:
+#    - BONE parent -> rigid (all verts -> parent bone)
+#    - ARMATURE modifier -> vertex groups (up to 4 bones, weights normalized)
 ```
 
 ### Step 7: Sort & Fragment
@@ -115,6 +117,7 @@ ibm = bone_mat.inverted()
 # Sort ALL faces by avgZ (painter's algorithm)
 # Split into ~1900-face parts
 # Each part: only used vertices (remapped 1-based), own skinning data
+# Output as flat arrays
 ```
 
 ### Step 8: Export Animations
@@ -126,14 +129,14 @@ ibm = bone_mat.inverted()
 
 ### Step 8b: Re-Export Safe Sampling (when Part files already exist)
 ```python
-# ⚠️ ONLY when re-exporting animations for an existing model
+# ONLY when re-exporting animations for an existing model
 # 1. Parse rest pose from existing Part file
 # 2. Detect mismatched bones: dot(blender_rest_local.rot, file_rest_local.rot) < 0.95
 # 3. Get keyframed bone names from action FCurves
 # 4. Three-tier hybrid:
-#    - NOT keyed → exact file rest values (translation + rotation)
-#    - Keyed + match (dot ≥ 0.95) → file_rest_local × (blender_rest_local⁻¹ × anim_local)
-#    - Keyed + mismatch (dot < 0.95) → file_rest_local × (rest_basis⁻¹ × frame_basis)
+#    - NOT keyed -> exact file rest values (translation + rotation)
+#    - Keyed + match (dot >= 0.95) -> file_rest_local x (blender_rest_local_inv x anim_local)
+#    - Keyed + mismatch (dot < 0.95) -> file_rest_local x (rest_basis_inv x frame_basis)
 # 5. Animation composition: merge Idle channels with partial animations
 #    (e.g., Yes = Idle body breathing + Head nod from Yes action)
 ```
@@ -141,16 +144,49 @@ ibm = bone_mat.inverted()
 ### Step 9: Optimize Channels
 ```python
 # Per bone per path:
-# - Constant AND matches posed-rest → REMOVE
-# - Constant but DIFFERS from posed-rest → 2-keyframe
-# - Varies → full channel
+# - Constant AND matches posed-rest -> REMOVE
+# - Constant but DIFFERS from posed-rest -> 2-keyframe
+# - Varies -> full channel
 ```
 
 ### Step 10: Verify & Write
 ```python
 # MANDATORY: skin matrices = Identity at posed rest (< 0.001)
 # Write: Part files (skeleton in first) + Animation files (separate)
+# Vertices and faces as flat arrays
 ```
+
+---
+
+## Flat Array Data Format
+
+### Vertices (stride 3)
+```luau
+-- x, y, z, x, y, z, ...
+ModelData.vertices = {
+  10.825, -18.875, -1.141,
+  11.296, -19.324, 1.685,
+}
+-- Access: base = (i - 1) * 3; vx = vertices[base + 1]
+-- Count: #vertices / 3
+```
+
+### Faces (stride 4)
+```luau
+-- v1, v2, v3, category, v1, v2, v3, category, ...
+ModelData.faces = {
+  4150, 4151, 4152, 1,
+  4151, 4150, 4153, 1,
+}
+-- Access: fBase = fi * 4; vi1 = faces[fBase + 1], category = faces[fBase + 4]
+-- Count: #faces / 4
+```
+
+### Converting Existing Files
+```bash
+python3 convert_flat.py
+```
+Converts table-of-tables format to flat arrays. Preserves skeleton, skinning, and animation data.
 
 ---
 
@@ -162,12 +198,14 @@ ibm = bone_mat.inverted()
 - **Joint indices:** 1-based in files (Luau arrays).
 - **Skinning patterns:** 0-based bone indices. Runtime adds `+1`.
 - **Transforms:** ABSOLUTE (not deltas).
+- **Vertices:** Flat arrays, stride 3.
+- **Faces:** Flat arrays, stride 4.
 
 ### Runtime Pipeline
 ```
-sampleAnimation()  →  writes absolute local transforms
-updateSkeleton()   →  computes worldMatrices + skinMatrices
-skinVerticesFact() →  transforms vertices by bone skinMatrix
+sampleAnimation()  ->  writes absolute local transforms
+updateSkeleton()   ->  computes worldMatrices + skinMatrices
+skinVerticesFact() ->  transforms vertices by bone skinMatrix (flat array in/out)
 ```
 
 ### Static Channel Optimization (CRITICAL)
@@ -175,11 +213,11 @@ skinVerticesFact() →  transforms vertices by bone skinMatrix
 EPSILON = 0.0001
 if is_constant_across_frames:
     if matches_posed_rest(epsilon=EPSILON):
-        pass  # REMOVE — sampleAnimation resets to rest = posed-rest
+        pass  # REMOVE - sampleAnimation resets to rest = posed-rest
     else:
-        keep_as_2_keyframe(times=[0, duration])  # KEEP — differs from default
+        keep_as_2_keyframe(times=[0, duration])  # KEEP - differs from default
 else:
-    keep_full_channel()  # KEEP — values vary
+    keep_full_channel()  # KEEP - values vary
 ```
 
 ---
@@ -188,11 +226,11 @@ else:
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Max faces/file | **~1900** | Using `c=index` |
+| Max faces/file | **~1900** | With flat format (stride 4) |
 | Max vertices/file | **~2500** | With vertex optimization |
 
-**Category index** (`c=1`) instead of RGB → ~60% smaller.
-**Factorized skinning** (patterns + index) → ~40% smaller.
+**Flat arrays** (stride 3 vertices, stride 4 faces) -> ~33% smaller.
+**Factorized skinning** (patterns + index) -> ~40% smaller.
 **Animations** in separate files from Part data.
 
 ---
@@ -201,11 +239,11 @@ else:
 
 | Mesh Parent Type | Skinning | Example |
 |-----------------|----------|---------|
-| **BONE parent** (rigid) | All verts → parent bone | Torso, head, limbs |
-| **ARMATURE modifier** | Vertex groups → up to 4 bones | Hands, flexible parts |
+| **BONE parent** (rigid) | All verts -> parent bone | Torso, head, limbs |
+| **ARMATURE modifier** | Vertex groups -> up to 4 bones | Hands, flexible parts |
 | **No parent** | Excluded from export | Helpers, lights |
 
-All meshes share ONE skeleton, ONE normalization. Vertices merged, faces Z-sorted across all meshes before fragmenting.
+All meshes share ONE skeleton, ONE normalization. Vertices merged as flat arrays, faces Z-sorted across all meshes before fragmenting.
 
 ---
 
@@ -221,9 +259,9 @@ export type ProjectedFace = {
 
 ### 2. depthBias on processFaces
 ```luau
--- Z-sliced parts → depthBias = 0 for all
--- Separate objects → depthBias = 0, 10, 20
--- Wall overlay → depthBias = 99, 100
+-- Z-sliced parts -> depthBias = 0 for all
+-- Separate objects -> depthBias = 0, 10, 20
+-- Wall overlay -> depthBias = 99, 100
 ```
 
 ### 3. Stable Sort
@@ -241,7 +279,7 @@ end)
 ## Multi-Zone Coloring
 
 1. Blender: one material per zone
-2. Export: each material → `c=1..N` (sorted alphabetically)
+2. Export: each material -> category `1..N` (sorted alphabetically)
 3. Node Script: `Input<Color>` per zone + `colorMap` lookup
 
 ```luau
@@ -250,7 +288,9 @@ local colorMap: { [number]: Color } = {
     [2] = self.headColor,
     [3] = self.armsColor,
 }
-local faceColor = colorMap[face.c] or self.bodyColor
+-- Read category from flat face array:
+local category = faces[fBase + 4]
+local faceColor = colorMap[category] or self.bodyColor
 ```
 
 ---
@@ -258,10 +298,12 @@ local faceColor = colorMap[face.c] or self.bodyColor
 ## Wall-Mounted Surfaces
 
 1. Remove surface from Blender mesh
-2. Hardcode vertices/faces in Node Script (`advance()`)
+2. Hardcode vertices/faces in Node Script (`advance()`) as flat arrays
 3. Position 1-2 units from wall + `depthBias=99/100`
 
 ```luau
+local screenVerts = { -51, 48.66, -8.82, -51, 40.00, -8.82, -30, 48.66, -8.82, -30, 40.00, -8.82 }
+local screenFaces = { 1, 2, 3, 12, 1, 3, 4, 12 }
 processFaces(self, screenVerts, screenFaces, ..., 100)
 ```
 
@@ -281,19 +323,33 @@ ModelData.skinningPatterns = S
 ModelData.skinningIndex = {1, 1, 1, 6, 6, 2, ...}  -- Pattern index per vertex
 ```
 
-### Runtime Usage
+### Runtime Usage (Flat Arrays)
 ```luau
-local function skinVerticesFact(skeleton, vertices, skinningPatterns, skinningIndex)
-    for i, v in ipairs(vertices) do
+local function skinVerticesFact(skeleton, vertices: {number}, skinningPatterns, skinningIndex): {number}
+    local vertCount = #skinningIndex
+    local result: {number} = table.create(vertCount * 3, 0)
+    for i = 1, vertCount do
+        local base = (i - 1) * 3
+        local vx, vy, vz = vertices[base + 1], vertices[base + 2], vertices[base + 3]
         local skin = skinningPatterns[skinningIndex[i]]
+        local sx, sy, sz = 0.0, 0.0, 0.0
         for k = 1, 4 do
-            local jointIdx = skin.j[k] + 1  -- 0-based → 1-based
+            local jointIdx = skin.j[k] + 1  -- 0-based -> 1-based
             local weight = skin.w[k]
             if weight > 0 then
                 -- Transform vertex by skinMatrix[jointIdx]
+                local skinMat = skeleton.skinMatrices[jointIdx]
+                local tx, ty, tz = M.mat4TransformPoint(skinMat, vx, vy, vz)
+                sx = sx + tx * weight
+                sy = sy + ty * weight
+                sz = sz + tz * weight
             end
         end
+        result[base + 1] = sx
+        result[base + 2] = sy
+        result[base + 3] = sz
     end
+    return result
 end
 ```
 
@@ -301,9 +357,9 @@ end
 
 ## Coordinate System (Blender Z-up)
 
-- `rotationY` (Yaw) → Rotate in XY plane (turntable)
-- `rotationX` (Pitch) → Tilt forward/back
-- `rotationZ` (Roll) → Tilt left/right
+- `rotationY` (Yaw) -> Rotate in XY plane (turntable)
+- `rotationX` (Pitch) -> Tilt forward/back
+- `rotationZ` (Roll) -> Tilt left/right
 
 ```luau
 -- Yaw: x,y rotation (cosY/sinY)
@@ -322,8 +378,10 @@ table.sort(faces, function(a: ProjectedFace, b: ProjectedFace): boolean
 end)
 ```
 
-### Type Casting for Untyped Data
+### Type Casting for Flat Array Data
 ```luau
+local vertices = (PartAData :: any).vertices :: { number }
+local faces = (PartAData :: any).faces :: { number }
 local animations = (PartAData :: any).animations :: { [string]: SkelAnim.AnimationClip }?
 ```
 
@@ -351,8 +409,13 @@ ModelData.skeleton = {  -- First part only
   inverseBindMatrices = { {16 floats}, ... },
   restPose = { { translation = {x,y,z}, rotation = {w,x,y,z}, scale = {1,1,1} }, ... },
 }
-ModelData.vertices = { {x=0, y=0, z=0}, ... }
-ModelData.faces = { {verts={1,2,3}, c=1}, ... }
+
+-- Flat vertex array (stride 3)
+ModelData.vertices = { 10.825, -18.875, -1.141, 11.296, -19.324, 1.685, ... }
+
+-- Flat face array (stride 4)
+ModelData.faces = { 4150, 4151, 4152, 1, 4151, 4150, 4153, 1, ... }
+
 ModelData.skinningPatterns = S
 ModelData.skinningIndex = {1, 1, 1, 6, 6, ...}
 ```
@@ -370,7 +433,7 @@ ModelData.animations = {
 }
 ```
 
-**Key:** jointIndex = 1-based, rotation = WXYZ, transforms = ABSOLUTE.
+**Key:** jointIndex = 1-based, rotation = WXYZ, transforms = ABSOLUTE, vertices = flat stride 3, faces = flat stride 4.
 
 ---
 
@@ -386,10 +449,11 @@ ModelData.animations = {
 | Faces flickering | Z-fighting | 3-technique anti-flickering |
 | Animation wrong | Deltas not absolute | ABSOLUTE local transforms |
 | Quaternion issues | WXYZ/XYZW mismatch | Data=WXYZ, runtime converts |
-| File too large | Repeated skinning | Factorized skinning |
+| File too large | Repeated skinning | Factorized skinning + flat arrays |
 | Non-triangular faces | Quads/ngons | Triangulate via bmesh |
 | `StructRNA removed` | Freed evaluated mesh | Use temp mesh copy |
 | `rotationSpeed` broken | No markNeedsUpdate | Store context |
+| Colors all same | Wrong category read | `faces[fBase + 4]` for category |
 | **Fingers stretched on re-export** | **Quaternion sign ambiguity (dot < 0.95)** | **`matrix_basis` delta for mismatched bones** |
 | **Re-export differs from original** | **`decompose()` not unique across sessions** | **Three-tier hybrid sampling (Step 8b)** |
 | **Body frozen in partial anim** | **Only head/hands keyed, rest at rest pose** | **Animation composition: merge Idle + target** |
@@ -407,12 +471,13 @@ ModelData.animations = {
 - [ ] Animations WITHOUT resetting `matrix_basis`
 - [ ] Static channels vs POSED REST
 - [ ] Skin matrices = Identity verified (< 0.001)
-- [ ] Materials → category indices (alphabetical)
-- [ ] Faces Z-sorted → fragments → vertex optimization
+- [ ] Materials -> category indices (alphabetical)
+- [ ] **Flat arrays**: vertices stride 3, faces stride 4
+- [ ] Faces Z-sorted -> fragments -> vertex optimization
 - [ ] Factorized skinning (patterns + index)
 - [ ] ABSOLUTE WXYZ transforms, 1-based joints
 - [ ] Anti-flickering + depthBias
 - [ ] `context:markNeedsUpdate()` for rotation/animation
 - [ ] **Re-export: quaternion mismatch detection** (rest local dot < 0.95)
-- [ ] **Re-export: hybrid sampling** (non-keyed → file rest, keyed → delta or matrix_basis delta)
+- [ ] **Re-export: hybrid sampling** (non-keyed -> file rest, keyed -> delta or matrix_basis delta)
 - [ ] **Partial animations: composition with Idle** (resample + looping)
