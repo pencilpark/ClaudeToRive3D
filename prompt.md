@@ -182,11 +182,12 @@ ModelData.faces = {
 -- Count: #faces / 4
 ```
 
-### Converting Existing Files
+### Post-Export Optimization
 ```bash
-python3 convert_flat.py
+python3 convert_flat.py           # Vertices/faces → flat arrays (~33% smaller)
+python3 convert_shared_times.py   # Factorize duplicate times in animations (~10% smaller)
 ```
-Converts table-of-tables format to flat arrays. Preserves skeleton, skinning, and animation data.
+Both scripts are idempotent (safe to re-run) and preserve data they don't modify.
 
 ---
 
@@ -327,7 +328,7 @@ ModelData.skinningIndex = {1, 1, 1, 6, 6, 2, ...}  -- Pattern index per vertex
 ```luau
 local function skinVerticesFact(skeleton, vertices: {number}, skinningPatterns, skinningIndex): {number}
     local vertCount = #skinningIndex
-    local result: {number} = table.create(vertCount * 3, 0)
+    local result: {number} = {}
     for i = 1, vertCount do
         local base = (i - 1) * 3
         local vx, vy, vz = vertices[base + 1], vertices[base + 2], vertices[base + 3]
@@ -370,6 +371,18 @@ end
 ---
 
 ## Rive Luau Restrictions
+
+### NO `table.create()` — Roblox-Only
+```luau
+-- WRONG: crashes at runtime (Roblox extension, not in Rive)
+local result = table.create(6000)
+
+-- CORRECT: standard Luau
+local result = {}
+```
+
+### Constructor MUST Mirror ALL Type Fields
+Every field declared in the `type` MUST also appear in the `return function()` constructor with an initial value. Missing field → `nil` at runtime → crash.
 
 ### table.sort MUST Have Type Annotations
 ```luau
@@ -425,15 +438,18 @@ ModelData.skinningIndex = {1, 1, 1, 6, 6, ...}
 ModelData.animations = {
   ["walk"] = {
     name = "walk", duration = 1.5,
+    sharedTimes = {
+      {0, 0.033, 0.067, 0.1, ...},  -- Factorized time arrays
+    },
     channels = {
-      { jointIndex = 1, path = "rotation", times = {...}, values = {w,x,y,z,...} },
-      { jointIndex = 1, path = "translation", times = {...}, values = {x,y,z,...} },
+      { jointIndex = 1, path = "rotation", timeRef = 1, values = {w,x,y,z,...} },
+      { jointIndex = 1, path = "translation", timeRef = 1, values = {x,y,z,...} },
     },
   },
 }
 ```
 
-**Key:** jointIndex = 1-based, rotation = WXYZ, transforms = ABSOLUTE, vertices = flat stride 3, faces = flat stride 4.
+**Key:** jointIndex = 1-based, `timeRef` = 1-based index into `sharedTimes`, rotation = WXYZ, transforms = ABSOLUTE, vertices = flat stride 3, faces = flat stride 4.
 
 ---
 
@@ -457,6 +473,8 @@ ModelData.animations = {
 | **Fingers stretched on re-export** | **Quaternion sign ambiguity (dot < 0.95)** | **`matrix_basis` delta for mismatched bones** |
 | **Re-export differs from original** | **`decompose()` not unique across sessions** | **Three-tier hybrid sampling (Step 8b)** |
 | **Body frozen in partial anim** | **Only head/hands keyed, rest at rest pose** | **Animation composition: merge Idle + target** |
+| **`table.create` runtime error** | **Roblox-only, not in Rive Luau** | **Use `{}` instead** |
+| **`nil` field crash in advance()** | **Field missing from constructor** | **Add field to `return function()` object** |
 
 ---
 

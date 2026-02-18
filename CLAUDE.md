@@ -121,6 +121,7 @@ YOUR_MODEL/
 ├── SkeletalAnimUtil.luau    # Skeletal animation system
 ├── blender_to_rive.py       # Universal export script
 ├── convert_flat.py          # Convert data files to flat arrays (post-export optimization)
+├── convert_shared_times.py  # Factorize duplicate times arrays in animation files
 ├── prompt.md                # AI agent prompt for Claude Code
 └── CLAUDE.md                # This documentation
 ```
@@ -185,7 +186,6 @@ local faceCount = #faces / 4
 ```
 
 ### Performance Benefits
-- `table.create(vertCount * 3, 0)` pre-allocates flat result array — avoids GC pressure
 - Direct index assignment `result[base + 1] = sx` instead of `table.insert(result, {x=sx, ...})`
 - Triangles are always 3 vertices — unroll the face loop instead of ipairs
 - ~33% file size reduction across all Part data files
@@ -196,6 +196,36 @@ Use `convert_flat.py` to convert table-of-tables format to flat arrays:
 python3 convert_flat.py
 ```
 The script auto-detects and converts `.vertices` and `.faces` blocks while preserving skeleton, skinning, and animation data unchanged.
+
+### Shared Time Arrays (Animation Optimization)
+Within each animation clip, channels often share identical `times` arrays — duplicated inline per channel. Use `convert_shared_times.py` to factorize them:
+```bash
+python3 convert_shared_times.py
+```
+
+**Before (~10% larger):**
+```luau
+channels = {
+  {jointIndex = 2, path = "rotation", times = {0, 0.033, 0.067, ...}, values = {...}},
+  {jointIndex = 7, path = "rotation", times = {0, 0.033, 0.067, ...}, values = {...}},
+}
+```
+
+**After (factorized):**
+```luau
+sharedTimes = {
+  {0, 0.033, 0.067, ...},  -- Pattern 1
+},
+channels = {
+  {jointIndex = 2, path = "rotation", timeRef = 1, values = {...}},
+  {jointIndex = 7, path = "rotation", timeRef = 1, values = {...}},
+}
+```
+
+- `timeRef` is a **1-based index** into the clip's `sharedTimes` table
+- Clips with multiple time patterns (e.g., different timing for translation vs rotation) get multiple entries in `sharedTimes`
+- `SkeletalAnimUtil.sampleAnimation()` resolves `timeRef` automatically at runtime
+- Typical savings: **~10% per animation file**
 
 ---
 
@@ -826,9 +856,12 @@ ModelData.animations = {
   ["walk"] = {
     name = "walk",
     duration = 1.5,
+    sharedTimes = {                         -- Factorized time arrays
+      {0, 0.033, 0.067, 0.1, ...},         -- Pattern 1
+    },
     channels = {
-      { jointIndex = 1, path = "rotation", times = {...}, values = {w,x,y,z,...} },
-      { jointIndex = 1, path = "translation", times = {...}, values = {x,y,z,...} },
+      { jointIndex = 1, path = "rotation", timeRef = 1, values = {w,x,y,z,...} },
+      { jointIndex = 1, path = "translation", timeRef = 1, values = {x,y,z,...} },
       ...
     },
   },
@@ -837,6 +870,7 @@ ModelData.animations = {
 
 **Key format details:**
 - `jointIndex` is **1-based** (Luau arrays)
+- `timeRef` is **1-based** index into `sharedTimes` (replaces inline `times`)
 - Rotation values are **WXYZ** (Blender native)
 - All transforms are **ABSOLUTE** (not deltas)
 - Vertices are **flat arrays** (stride 3)
@@ -845,6 +879,36 @@ ModelData.animations = {
 ---
 
 ## Rive Luau Specifics
+
+### NO `table.create()` — Roblox-Only
+`table.create()` does NOT exist in Rive's Luau runtime (it's a Roblox extension). Use `{}` instead:
+```luau
+-- WRONG: crashes at runtime
+local result = table.create(6000)
+
+-- CORRECT: standard Luau
+local result = {}
+local arr: { number } = {}
+```
+
+### Constructor MUST Mirror ALL Type Fields
+When defining a type with fields, the `return function()` constructor object MUST include ALL fields with initial values. Missing fields → `nil` at runtime → crash.
+```luau
+type Model3D = {
+    projectedFaces: { ProjectedFace },
+    projectedFaceCount: number,   -- Declared in type
+    ...
+}
+
+-- Constructor MUST include projectedFaceCount:
+return function(): Model3D
+    return {
+        projectedFaces = {},
+        projectedFaceCount = 0,   -- REQUIRED here too
+        ...
+    }
+end
+```
 
 ### table.sort Requires Type Annotations
 ```luau
@@ -900,7 +964,7 @@ local function skinVerticesFact(
     skinningIndex: { number }
 ): { number }
     local vertCount = #skinningIndex
-    local result: { number } = table.create(vertCount * 3, 0)
+    local result: { number } = {}
     for i = 1, vertCount do
         local base = (i - 1) * 3
         local vx, vy, vz = vertices[base + 1], vertices[base + 2], vertices[base + 3]
@@ -1022,7 +1086,8 @@ end
    - `ANIM_FILE_SPLIT` — manual animation grouping (or `None` for auto)
 3. Run script (`Alt+P` in Text Editor)
 4. Run `convert_flat.py` to optimize vertex/face data to flat arrays
-5. Copy generated `.luau` files to Rive project
+5. Run `convert_shared_times.py` to factorize duplicate time arrays in animation files
+6. Copy generated `.luau` files to Rive project
 
 ### Option B: Claude Code + Blender MCP (Preferred)
 1. Connect Blender MCP
@@ -1060,6 +1125,8 @@ Both produce the same output format.
 | **Fingers stretched/distorted on re-export** | **Quaternion sign ambiguity in rest local decomposition** | **Detect mismatched bones (dot < 0.95), use `matrix_basis` delta** |
 | **Re-export produces different results** | **`decompose()` yields different quaternions across sessions** | **Three-tier hybrid sampling (see Quaternion Sign Ambiguity section)** |
 | **Body frozen during partial animation** | **Only head/hands animated, rest receives rest pose** | **Animation composition: merge Idle channels with targeted animation** |
+| **`table.create` runtime error** | **Roblox-only function, not in Rive Luau** | **Use `{}` instead** |
+| **`nil` field crash in advance()** | **Field in type but missing from `return function()` constructor** | **Add field with initial value to constructor** |
 
 ---
 
@@ -1100,7 +1167,7 @@ Both produce the same output format.
 - Paths created in `advance()`, only drawn in `draw()`
 - Factorized skinning: minimal overhead (one lookup per vertex)
 - depthBias: zero runtime cost (just shifts depth value)
-- **Flat arrays**: `table.create(n, 0)` pre-allocation, direct index assignment, no GC from sub-tables
+- **Flat arrays**: direct index assignment, no GC from sub-tables
 - **Unrolled triangle loop**: fixed stride-4 iteration vs ipairs over face tables
 
 ---

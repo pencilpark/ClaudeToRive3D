@@ -6,22 +6,25 @@ Vertices: {x=N, y=N, z=N} → N, N, N,
 Faces: {verts = {a, b, c}, c = N} → a, b, c, N,
 
 Preserves everything else (skeleton, skinning, animations) unchanged.
+
+Usage:
+    python3 convert_flat.py                    # Auto-detect *Part*Data.luau files
+    python3 convert_flat.py file1.luau file2.luau  # Process specific files
 """
 
 import re
 import os
 import sys
+import glob
 
-# Files to convert
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FILES = [
-    "PioRobotPartAData.luau",
-    "PioRobotPartBData.luau",
-    "PioRobotPartCData.luau",
-    "RobotPartAData.luau",
-    "RobotPartBData.luau",
-    "RobotPartCData.luau",
-]
+
+
+def find_part_data_files(directory: str) -> list[str]:
+    """Auto-detect Part data files matching *Part*Data.luau pattern."""
+    pattern = os.path.join(directory, "*Part*Data.luau")
+    files = sorted(glob.glob(pattern))
+    return [os.path.basename(f) for f in files]
 
 
 def convert_vertices(content):
@@ -155,8 +158,20 @@ def process_file(filepath):
 
 
 def main():
-    for fname in FILES:
-        filepath = os.path.join(BASE_DIR, fname)
+    # Use CLI args if provided, otherwise auto-detect
+    if len(sys.argv) > 1:
+        files = sys.argv[1:]
+    else:
+        files = find_part_data_files(BASE_DIR)
+        if not files:
+            print("No *Part*Data.luau files found in current directory.")
+            print("Usage: python3 convert_flat.py [file1.luau file2.luau ...]")
+            sys.exit(1)
+
+    print(f"Files to process: {files}\n")
+
+    for fname in files:
+        filepath = os.path.join(BASE_DIR, fname) if not os.path.isabs(fname) else fname
         if os.path.exists(filepath):
             process_file(filepath)
         else:
