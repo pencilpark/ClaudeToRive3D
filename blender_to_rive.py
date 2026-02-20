@@ -1,26 +1,35 @@
 """
-Blender to Rive — Universal 3D Export (v5.0)
+Blender to Rive — Universal 3D Export (v6.0)
 =============================================
 
 Exports ANY Blender model (single or multi-mesh, any skeleton) to Rive Luau scripts.
 Handles bone-parented rigid meshes AND armature-modifier multi-bone skinning.
+Outputs FLAT ARRAYS (stride 3 vertices, stride 4 faces) + sharedTimes factorization.
 
-PROVEN PROCESS (PIO Robot: 15 meshes, 43 bones, 14 animations, 5664 faces):
-  1. Detect matrix_basis residuals → determines "posed rest" vs "pure rest"
-  2. Compute normalization in POSED REST position (all meshes combined)
+PROVEN PROCESS (FinnTheFrog: 1 mesh, 13 bones, 17 animations, 5846 faces,
+                PIO Robot: 15 meshes, 43 bones, 14 animations, 5664 faces):
+  1. Detect matrix_basis residuals -> determines "posed rest"
+  2. Compute normalization in POSED REST position (evaluated mesh, all meshes combined)
   3. Export skeleton IBMs from POSED REST (pose_bone.matrix, NOT bone.matrix_local)
   4. Export vertices in POSED REST (evaluated mesh with armature)
-  5. Export faces with triangulation + material categories + Z-sorting
-  6. Factorize skinning (patterns + index per part, supports multi-bone weights)
-  7. Sample animations as ABSOLUTE local transforms (never reset matrix_basis)
-  8. Optimize: remove static channels matching posed-rest, keep constant-but-different
-  9. Verify: skin matrices = Identity, skinned verts = original at posed rest
-  10. Fragment into Part files (~1900 faces each) + separate Anim files
+  5. Detect color zones: multiple materials OR Atlas texture UV sampling (QUANT_STEP=0.005)
+  6. Export faces with triangulation + color categories + Z-sorting
+  7. Factorize skinning (patterns + index per part, supports multi-bone weights)
+  8. Sample animations as ABSOLUTE local transforms (never reset matrix_basis)
+  9. Optimize: remove static channels matching rest pose, keep constant-but-different
+  10. Verify: skin matrices = Identity at posed rest
+  11. Fragment into Part files (~2950 faces each) + separate Anim files with sharedTimes
+
+CRITICAL: Steps 2-10 run in sequence — same Python execution ensures same depsgraph.
+When using Blender MCP, all steps MUST be in ONE single execute_blender_code call.
 
 Data format:
+  - Vertices: flat arrays (stride 3: x, y, z)
+  - Faces: flat arrays (stride 4: v1, v2, v3, category)
   - Quaternions: WXYZ in files (Blender native)
   - Joint indices: 1-based in files (Luau arrays)
   - Skinning patterns: 0-based bone indices (runtime adds +1)
+  - Animation times: sharedTimes + timeRef (factorized)
   - All data in SAME normalized coordinate space (~200 units max dimension)
 
 Usage:
@@ -32,7 +41,7 @@ Usage:
 Can also be executed step-by-step via Blender MCP (preferred for debugging).
 
 Author: Claude + Fred Berria
-Version: 5.1.0 (Universal Multi-Mesh + Posed Rest + Verified Export + Re-Export Mode)
+Version: 6.0.0 (Flat Arrays + sharedTimes + Atlas UV + Universal)
 """
 
 import bpy
@@ -45,31 +54,32 @@ import math
 # SETTINGS — EDIT THESE
 # ============================================================================
 
-MODEL_NAME = "PioRobot"           # Prefix for output files
+MODEL_NAME = "Model"              # Prefix for output files (e.g., "FinnTheFrog", "PioRobot")
 TARGET_SIZE = 200.0               # Normalize to ~200 units max dimension
-MAX_FACES_PER_PART = 1900         # Rive limit per script file
+MAX_FACES_PER_PART = 2950         # ~2950 with flat arrays (~1900 with table-of-tables)
 FPS = 30.0                        # Animation sampling rate
 EPSILON = 0.0001                  # Threshold for static channel optimization
-OUTPUT_DIR = "/Users/fredberria/PENCIL Park Dropbox/Frédéric BERRIA/_FRED STUFFS/RIVE AMBASSADOR/PIO_ROBOT"
+QUANT_STEP = 0.005                # Color quantization step for Atlas UV sampling (0.005 preserves distinct zones)
+OUTPUT_DIR = os.path.dirname(bpy.data.filepath) if bpy.data.filepath else "/tmp"
 
 # Meshes to EXCLUDE from export (e.g., helper objects, lights)
-EXCLUDE_MESHES = {"Icosphere"}
+EXCLUDE_MESHES = set()
 
-# Animation name mapping: Blender action name → short display name
+# Animation name mapping: Blender action name -> short display name
 # Set to None to auto-derive from action names
 ANIM_NAME_MAP = None  # or {"RobotArmature|Robot_Idle_RobotArmature": "Idle", ...}
 
 # How to split animations across files (list of lists of short names)
-# Set to None for automatic splitting (~3 anims per file)
-ANIM_FILE_SPLIT = None  # or [["Idle", "Walking", "Running"], ["Dance", "Wave", "Yes", "No"], ...]
+# Set to None for automatic splitting (~4-5 anims per file)
+ANIM_FILE_SPLIT = None  # or [["Idle", "Walk", "Run"], ["Dance", "Wave", "Yes", "No"], ...]
 
 # ============================================================================
 # RE-EXPORT MODE (for adding/fixing animations when Part files already exist)
 # ============================================================================
 # When True: uses three-tier hybrid sampling to handle quaternion sign ambiguity
-# - Non-keyed bones → exact file rest values
-# - Keyed + good match (dot ≥ 0.95) → world-space delta
-# - Keyed + mismatch (dot < 0.95) → matrix_basis delta
+# - Non-keyed bones -> exact file rest values
+# - Keyed + good match (dot >= 0.95) -> world-space delta
+# - Keyed + mismatch (dot < 0.95) -> matrix_basis delta
 # When False: standard export (original behavior, used for first-time exports)
 RE_EXPORT_MODE = False
 RE_EXPORT_REST_FILE = None  # Path to existing PartA .luau file with skeleton data
@@ -91,17 +101,17 @@ def fmt(n, decimals=6):
 
 
 def mat4_to_colmajor(mat):
-    """Blender Matrix → column-major 16 floats."""
+    """Blender Matrix -> column-major 16 floats."""
     return [round(mat[row][col], 6) for col in range(4) for row in range(4)]
 
 
 def quat_wxyz(q):
-    """Blender Quaternion → [w, x, y, z] list."""
+    """Blender Quaternion -> [w, x, y, z] list."""
     return [round(q.w, 6), round(q.x, 6), round(q.y, 6), round(q.z, 6)]
 
 
 def vec3_list(v, decimals=4):
-    """Vector → [x, y, z] list."""
+    """Vector -> [x, y, z] list."""
     return [round(v.x, decimals), round(v.y, decimals), round(v.z, decimals)]
 
 
@@ -162,7 +172,7 @@ def discover_model():
 # ============================================================================
 
 def detect_matrix_basis(armature):
-    """Check which bones have non-identity matrix_basis (default pose ≠ rest pose)."""
+    """Check which bones have non-identity matrix_basis (default pose != rest pose)."""
     if armature.animation_data:
         armature.animation_data.action = None
     armature.data.pose_position = 'POSE'
@@ -174,15 +184,14 @@ def detect_matrix_basis(armature):
         if loc.length > 0.0001 or abs(rot.w - 1.0) + abs(rot.x) + abs(rot.y) + abs(rot.z) > 0.001:
             residuals.append(pb.name)
 
-    use_posed_rest = len(residuals) > 0
     print(f"  matrix_basis residuals: {len(residuals)}/{len(armature.pose.bones)} bones")
     if residuals:
         for name in residuals[:5]:
-            print(f"    ⚠️ {name}")
+            print(f"    {name}")
         if len(residuals) > 5:
             print(f"    ... and {len(residuals) - 5} more")
-    print(f"  → Using {'POSED REST' if use_posed_rest else 'PURE REST'} mode")
-    return use_posed_rest
+    print(f"  -> Using POSED REST mode (always recommended)")
+    return len(residuals) > 0
 
 
 # ============================================================================
@@ -203,17 +212,17 @@ def build_bone_order(armature):
     order = []
     def dfs(name):
         order.append(name)
-        for child in children.get(name, []):
+        for child in sorted(children.get(name, [])):
             dfs(child)
 
-    for r in roots:
+    for r in sorted(roots):
         dfs(r)
 
     return order
 
 
 def compute_normalization(armature, mesh_objects):
-    """Compute bounding box and normalization matrix in POSED REST position."""
+    """Compute bounding box and normalization matrix from EVALUATED mesh (POSED REST)."""
     # Ensure posed rest
     if armature.animation_data:
         armature.animation_data.action = None
@@ -228,7 +237,7 @@ def compute_normalization(armature, mesh_objects):
     for info in mesh_objects:
         obj = info['object']
         eval_obj = obj.evaluated_get(depsgraph)
-        eval_mesh = eval_obj.to_mesh()
+        eval_mesh = bpy.data.meshes.new_from_object(eval_obj)
 
         for v in eval_mesh.vertices:
             wp = obj.matrix_world @ v.co
@@ -236,7 +245,7 @@ def compute_normalization(armature, mesh_objects):
                 min_c[i] = min(min_c[i], wp[i])
                 max_c[i] = max(max_c[i], wp[i])
 
-        eval_obj.to_mesh_clear()
+        bpy.data.meshes.remove(eval_mesh)
 
     center = Vector([(min_c[i] + max_c[i]) / 2 for i in range(3)])
     extent = max(max_c[i] - min_c[i] for i in range(3))
@@ -247,15 +256,15 @@ def compute_normalization(armature, mesh_objects):
     print(f"  Center: ({center.x:.4f}, {center.y:.4f}, {center.z:.4f})")
     print(f"  Extent: {extent:.4f}, Scale: {scale:.4f}")
 
-    return normalize_mat, center, scale
+    return normalize_mat, center, scale, depsgraph
 
 
 # ============================================================================
-# STEP 3: EXPORT SKELETON (POSED REST)
+# STEP 3: EXPORT SKELETON (POSED REST — pose_bone.matrix)
 # ============================================================================
 
 def export_skeleton(armature, bone_order, normalize_mat):
-    """Export skeleton IBMs and rest pose from POSED REST."""
+    """Export skeleton IBMs and rest pose from POSED REST (pose_bone.matrix)."""
     arm_world = armature.matrix_world
 
     # Ensure posed rest
@@ -319,14 +328,110 @@ def export_skeleton(armature, bone_order, normalize_mat):
 # STEP 4: EXPORT VERTICES, FACES, SKINNING (ALL MESHES)
 # ============================================================================
 
-def export_all_meshes(armature, mesh_objects, bone_order, normalize_mat):
-    """Export vertices, faces, and skinning from all mesh objects combined."""
+def detect_atlas_colors(mesh_obj, tri_mesh):
+    """Detect color zones from Atlas texture UV sampling.
+    Returns dict: face_index -> category (1-based), and zone info.
+    Returns None if no Atlas texture found."""
+
+    obj = mesh_obj
+    if not obj.material_slots or not obj.material_slots[0].material:
+        return None
+
+    mat = obj.material_slots[0].material
+    if not mat.node_tree:
+        return None
+
+    # Find texture image
+    tex_image = None
+    for node in mat.node_tree.nodes:
+        if node.type == 'TEX_IMAGE' and node.image:
+            tex_image = node.image
+            break
+
+    if not tex_image:
+        return None
+
+    # Get UV layer
+    if not tri_mesh.uv_layers:
+        return None
+    uv_layer = tri_mesh.uv_layers.active
+
+    # Read all pixels
+    img = tex_image
+    pixels = list(img.pixels)  # RGBA flat array
+    w, h = img.size
+
+    # Sample per-face color
+    face_colors = []
+    for poly in tri_mesh.polygons:
+        r_sum, g_sum, b_sum = 0, 0, 0
+        for li in poly.loop_indices:
+            uv = uv_layer.data[li].uv
+            px = int(uv.x * w) % w
+            py = int(uv.y * h) % h
+            idx = (py * w + px) * 4
+            r_sum += pixels[idx]
+            g_sum += pixels[idx + 1]
+            b_sum += pixels[idx + 2]
+        n = len(poly.loop_indices)
+        face_colors.append((r_sum / n, g_sum / n, b_sum / n))
+
+    # Quantize colors
+    def quantize(c):
+        return tuple(round(round(v / QUANT_STEP) * QUANT_STEP, 4) for v in c)
+
+    quant_colors = [quantize(c) for c in face_colors]
+
+    # Find unique colors and assign categories
+    unique_colors = sorted(set(quant_colors))
+    color_to_cat = {c: i + 1 for i, c in enumerate(unique_colors)}
+
+    # Name zones by visual appearance
+    def name_zone(rgb):
+        r, g, b = rgb
+        brightness = (r + g + b) / 3
+        if brightness > 0.7:
+            return "White"
+        elif brightness < 0.15:
+            return "NearBlack"
+        elif g > r * 1.2 and g > b * 1.2:
+            return "Green"
+        elif r > g * 1.3 and r > b * 1.3:
+            if g > 0.3:
+                return "Orange"
+            return "Red"
+        elif abs(r - g) < 0.05 and abs(g - b) < 0.05:
+            if brightness > 0.4:
+                return "LightGray"
+            elif brightness > 0.3:
+                return "MediumGray"
+            else:
+                return "DarkGray"
+        return f"Color_{brightness:.2f}"
+
+    zone_info = {}
+    for color in unique_colors:
+        cat = color_to_cat[color]
+        name = name_zone(color)
+        count = quant_colors.count(color)
+        zone_info[cat] = {'name': name, 'color': color, 'count': count}
+        print(f"    Zone {cat}: {name} RGB({color[0]:.3f},{color[1]:.3f},{color[2]:.3f}) -> {count} faces")
+
+    # Build face->category mapping
+    face_categories = {i: color_to_cat[quant_colors[i]] for i in range(len(quant_colors))}
+
+    return face_categories, zone_info
+
+
+def export_all_meshes(armature, mesh_objects, bone_order, normalize_mat, depsgraph):
+    """Export vertices, faces, and skinning from all mesh objects combined.
+    Uses evaluated mesh from the SAME depsgraph as normalization + skeleton."""
     if armature.animation_data:
         armature.animation_data.action = None
     armature.data.pose_position = 'POSE'
     bpy.context.view_layer.update()
 
-    # Material sorting: alphabetical → stable category indices
+    # Material sorting: alphabetical -> stable category indices
     all_materials = set()
     for info in mesh_objects:
         obj = info['object']
@@ -337,12 +442,11 @@ def export_all_meshes(armature, mesh_objects, bone_order, normalize_mat):
     material_map = {name: i + 1 for i, name in enumerate(sorted_materials)}
     print(f"  Materials: {material_map}")
 
-    all_vertices = []
-    all_faces = []
-    all_skinning = []
+    all_vertices = []   # List of (x, y, z) tuples
+    all_faces = []      # List of (v1, v2, v3, category) tuples
+    all_skinning = []   # List of {'j': [...], 'w': [...]}
     vertex_offset = 0
-
-    depsgraph = bpy.context.evaluated_depsgraph_get()
+    all_zone_info = {}
 
     for info in mesh_objects:
         obj = info['object']
@@ -351,23 +455,30 @@ def export_all_meshes(armature, mesh_objects, bone_order, normalize_mat):
 
         # Get evaluated mesh and triangulate
         eval_obj = obj.evaluated_get(depsgraph)
-        temp_mesh_src = eval_obj.to_mesh()
+        eval_mesh = bpy.data.meshes.new_from_object(eval_obj)
 
         bm = bmesh.new()
-        bm.from_mesh(temp_mesh_src)
+        bm.from_mesh(eval_mesh)
         bmesh.ops.triangulate(bm, faces=bm.faces[:])
         tri_mesh = bpy.data.meshes.new("_temp_tri")
         bm.to_mesh(tri_mesh)
         bm.free()
-        eval_obj.to_mesh_clear()
 
         combined = normalize_mat @ obj.matrix_world
 
-        # Vertices
+        # Try Atlas UV sampling for color zones (single material + texture)
+        atlas_categories = None
+        if len(sorted_materials) == 1 or (len(obj.material_slots) == 1):
+            result = detect_atlas_colors(obj, tri_mesh)
+            if result:
+                atlas_categories, zone_info = result
+                all_zone_info.update(zone_info)
+
+        # Vertices (flat: just store x, y, z)
         mesh_verts = []
         for v in tri_mesh.vertices:
             wp = combined @ v.co
-            mesh_verts.append({'x': round(wp.x, 2), 'y': round(wp.y, 2), 'z': round(wp.z, 2)})
+            mesh_verts.append((round(wp.x, 3), round(wp.y, 3), round(wp.z, 3)))
 
         # Skinning
         mesh_skin = []
@@ -396,16 +507,18 @@ def export_all_meshes(armature, mesh_objects, bone_order, normalize_mat):
             for _ in tri_mesh.vertices:
                 mesh_skin.append({'j': [bidx, 0, 0, 0], 'w': [1.0, 0.0, 0.0, 0.0]})
 
-        # Faces
+        # Faces (flat: v1, v2, v3, category)
         face_count = 0
-        for poly in tri_mesh.polygons:
-            if poly.material_index < len(obj.material_slots) and obj.material_slots[poly.material_index].material:
+        for fi, poly in enumerate(tri_mesh.polygons):
+            if atlas_categories is not None:
+                category = atlas_categories.get(fi, 1)
+            elif poly.material_index < len(obj.material_slots) and obj.material_slots[poly.material_index].material:
                 mat_name = obj.material_slots[poly.material_index].material.name
+                category = material_map.get(mat_name, 1)
             else:
-                mat_name = sorted_materials[0] if sorted_materials else "Default"
-            category = material_map.get(mat_name, 1)
+                category = 1
             verts_1based = [vi + 1 + vertex_offset for vi in poly.vertices]
-            all_faces.append({'verts': list(verts_1based), 'c': category})
+            all_faces.append((verts_1based[0], verts_1based[1], verts_1based[2], category))
             face_count += 1
 
         all_vertices.extend(mesh_verts)
@@ -413,10 +526,13 @@ def export_all_meshes(armature, mesh_objects, bone_order, normalize_mat):
         vertex_offset += len(mesh_verts)
 
         bpy.data.meshes.remove(tri_mesh)
+        bpy.data.meshes.remove(eval_mesh)
         print(f"    {obj.name}: {len(mesh_verts)}v/{face_count}f [{skin_type}]")
 
     print(f"  Total: {len(all_vertices)} vertices, {len(all_faces)} faces")
-    return all_vertices, all_faces, all_skinning, material_map
+    if all_zone_info:
+        print(f"  Color zones: {len(all_zone_info)}")
+    return all_vertices, all_faces, all_skinning, material_map, all_zone_info
 
 
 # ============================================================================
@@ -428,7 +544,8 @@ def sort_and_fragment(all_vertices, all_faces, all_skinning):
 
     # Sort by average Z
     def avg_z(face):
-        return sum(all_vertices[vi - 1]['z'] for vi in face['verts']) / len(face['verts'])
+        v1, v2, v3, _ = face
+        return (all_vertices[v1 - 1][2] + all_vertices[v2 - 1][2] + all_vertices[v3 - 1][2]) / 3
 
     all_faces.sort(key=avg_z)
 
@@ -439,9 +556,10 @@ def sort_and_fragment(all_vertices, all_faces, all_skinning):
     for chunk in chunks:
         # Extract used vertices
         used = set()
-        for f in chunk:
-            for vi in f['verts']:
-                used.add(vi)
+        for v1, v2, v3, _ in chunk:
+            used.add(v1)
+            used.add(v2)
+            used.add(v3)
 
         used_sorted = sorted(used)
         remap = {old: new + 1 for new, old in enumerate(used_sorted)}
@@ -449,7 +567,7 @@ def sort_and_fragment(all_vertices, all_faces, all_skinning):
         verts = [all_vertices[vi - 1] for vi in used_sorted]
         skin = [all_skinning[vi - 1] for vi in used_sorted]
 
-        faces = [{'verts': [remap[vi] for vi in f['verts']], 'c': f['c']} for f in chunk]
+        faces = [(remap[v1], remap[v2], remap[v3], c) for v1, v2, v3, c in chunk]
 
         # Factorize skinning
         patterns, indices = factorize_skinning(skin)
@@ -556,7 +674,7 @@ def detect_mismatched_bones(armature, bone_order, normalize_mat, file_rest_local
         dot = abs(blender_rot.dot(file_rot))
         if dot < MISMATCH_THRESHOLD:
             mismatched.add(joint_idx)
-            print(f"    ⚠️ J{joint_idx}({name}): dot={dot:.3f} → MISMATCHED")
+            print(f"    J{joint_idx}({name}): dot={dot:.3f} -> MISMATCHED")
 
     print(f"  Mismatched bones: {len(mismatched)}/{len(bone_order)}")
     return mismatched
@@ -581,9 +699,9 @@ def export_animations(armature, bone_order, normalize_mat):
     """Sample all animations as ABSOLUTE local transforms. Never reset matrix_basis.
 
     When RE_EXPORT_MODE is True, uses three-tier hybrid sampling:
-    - Non-keyed bones → exact file rest values
-    - Keyed + good match (dot ≥ 0.95) → world-space delta
-    - Keyed + mismatch (dot < 0.95) → matrix_basis delta
+    - Non-keyed bones -> exact file rest values
+    - Keyed + good match (dot >= 0.95) -> world-space delta
+    - Keyed + mismatch (dot < 0.95) -> matrix_basis delta
     """
     arm_world = armature.matrix_world
     all_animations = {}
@@ -662,7 +780,7 @@ def export_animations(armature, bone_order, normalize_mat):
         if ANIM_NAME_MAP and action.name in ANIM_NAME_MAP:
             short_name = ANIM_NAME_MAP[action.name]
         else:
-            # Auto-derive: "RobotArmature|Robot_Walking_RobotArmature" → "Walking"
+            # Auto-derive: "RobotArmature|Robot_Walking_RobotArmature" -> "Walking"
             name_parts = action.name.split('|')
             if len(name_parts) > 1:
                 inner = name_parts[1]
@@ -704,7 +822,7 @@ def export_animations(armature, bone_order, normalize_mat):
                     pb = armature.pose.bones[name]
 
                     if joint_idx not in animated_indices:
-                        # Tier 1: NOT keyed → exact file rest values
+                        # Tier 1: NOT keyed -> exact file rest values
                         fr = file_rest_locals[joint_idx]
                         bone_samples[name]['translation'].append(
                             [round(fr['translation'][0], 4),
@@ -718,7 +836,7 @@ def export_animations(armature, bone_order, normalize_mat):
                              round(fr['rotation'][3], 6)]
                         )
                     elif joint_idx in mismatched_bones:
-                        # Tier 3: Keyed + MISMATCHED → matrix_basis delta
+                        # Tier 3: Keyed + MISMATCHED -> matrix_basis delta
                         rest_basis = rest_basis_map[name]
                         frame_basis = pb.matrix_basis.copy()
                         delta_basis = rest_basis.inverted() @ frame_basis
@@ -727,8 +845,7 @@ def export_animations(armature, bone_order, normalize_mat):
                         bone_samples[name]['translation'].append(vec3_list(loc))
                         bone_samples[name]['rotation'].append(quat_wxyz(rot))
                     else:
-                        # Tier 2: Keyed + GOOD MATCH → world-space delta
-                        # Compute current animation local
+                        # Tier 2: Keyed + GOOD MATCH -> world-space delta
                         bw = arm_world @ pb.matrix
                         bn = normalize_mat @ bw
                         loc_w, rot_w, _ = bn.decompose()
@@ -773,7 +890,6 @@ def export_animations(armature, bone_order, normalize_mat):
                     bone_samples[name]['rotation'].append(quat_wxyz(rot))
 
         # Optimize channels (same logic for both modes)
-        # In RE-EXPORT mode, compare against FILE rest locals
         ref_rest = {}
         if RE_EXPORT_MODE and file_rest_locals:
             for bi, name in enumerate(bone_order):
@@ -805,7 +921,7 @@ def export_animations(armature, bone_order, normalize_mat):
                     # Check if matches rest
                     matches_rest = all(abs(ref[k] - rest_vals[k]) < EPSILON for k in range(len(ref)))
                     if matches_rest:
-                        continue  # Skip — sampleAnimation resets to rest
+                        continue  # Skip -- sampleAnimation resets to rest
                     else:
                         # Keep as 2-keyframe
                         flat = []
@@ -876,21 +992,21 @@ def verify_skeleton(skeleton_data, bone_order):
                     max_dev = dev
                     worst = name
 
-    status = "✓ PASS" if max_dev < 0.001 else "✗ FAIL"
+    status = "PASS" if max_dev < 0.001 else "FAIL"
     print(f"  Skin matrix verification: {status} (max deviation: {max_dev:.8f}, bone: {worst})")
     return max_dev < 0.001
 
 
 # ============================================================================
-# STEP 8: WRITE LUAU FILES
+# STEP 8: WRITE LUAU FILES (FLAT ARRAYS + sharedTimes)
 # ============================================================================
 
 def write_part_file(filepath, var_name, part, skeleton_data=None, bone_order=None):
-    """Write one Part .luau file."""
+    """Write one Part .luau file with flat arrays."""
     lines = []
     lines.append("--!strict")
     lines.append(f"-- {os.path.basename(filepath)}")
-    lines.append(f"-- Auto-generated by blender_to_rive.py v5.1")
+    lines.append(f"-- Auto-generated by blender_to_rive.py v6.0")
     lines.append(f"-- Vertices: {len(part['vertices'])}, Faces: {len(part['faces'])}")
     lines.append("")
     lines.append(f"local {var_name} = {{}}")
@@ -936,20 +1052,53 @@ def write_part_file(filepath, var_name, part, skeleton_data=None, bone_order=Non
         lines.append("}")
         lines.append("")
 
-    # Vertices
-    lines.append(f"-- Vertices ({len(part['vertices'])})")
+    # Vertices (flat array: stride 3)
+    lines.append(f"-- Vertices ({len(part['vertices'])}) — flat array stride 3: x, y, z")
     lines.append(f"{var_name}.vertices = {{")
-    for v in part['vertices']:
-        lines.append(f"  {{x={v['x']}, y={v['y']}, z={v['z']}}},")
+    # Write ~10 vertices per line for readability
+    vals = []
+    for x, y, z in part['vertices']:
+        vals.extend([fmt(x, 3), fmt(y, 3), fmt(z, 3)])
+    # Wrap at ~120 chars per line
+    current_line = []
+    current_len = 0
+    vert_lines = []
+    for val in vals:
+        entry = val + ","
+        if current_len + len(entry) + 1 > 120 and current_line:
+            vert_lines.append("  " + " ".join(current_line))
+            current_line = [entry]
+            current_len = len(entry)
+        else:
+            current_line.append(entry)
+            current_len += len(entry) + 1
+    if current_line:
+        vert_lines.append("  " + " ".join(current_line))
+    lines.extend(vert_lines)
     lines.append("}")
     lines.append("")
 
-    # Faces
-    lines.append(f"-- Faces ({len(part['faces'])})")
+    # Faces (flat array: stride 4)
+    lines.append(f"-- Faces ({len(part['faces'])}) — flat array stride 4: v1, v2, v3, category")
     lines.append(f"{var_name}.faces = {{")
-    for f in part['faces']:
-        vs = f['verts']
-        lines.append(f"  {{verts = {{{vs[0]}, {vs[1]}, {vs[2]}}}, c = {f['c']}}},")
+    face_vals = []
+    for v1, v2, v3, c in part['faces']:
+        face_vals.extend([str(v1), str(v2), str(v3), str(c)])
+    current_line = []
+    current_len = 0
+    face_lines = []
+    for val in face_vals:
+        entry = val + ","
+        if current_len + len(entry) + 1 > 120 and current_line:
+            face_lines.append("  " + " ".join(current_line))
+            current_line = [entry]
+            current_len = len(entry)
+        else:
+            current_line.append(entry)
+            current_len += len(entry) + 1
+    if current_line:
+        face_lines.append("  " + " ".join(current_line))
+    lines.extend(face_lines)
     lines.append("}")
     lines.append("")
 
@@ -962,12 +1111,39 @@ def write_part_file(filepath, var_name, part, skeleton_data=None, bone_order=Non
     print(f"  Written: {os.path.basename(filepath)} ({size_kb:.1f} KB)")
 
 
+def factorize_shared_times(channels):
+    """Factorize duplicate times arrays within a clip's channels.
+    Returns (shared_times_list, modified_channels) where channels use timeRef instead of times."""
+    unique_times = []
+    times_to_ref = {}  # tuple of times -> 1-based ref
+
+    for ch in channels:
+        times_key = tuple(ch['times'])
+        if times_key not in times_to_ref:
+            unique_times.append(ch['times'])
+            times_to_ref[times_key] = len(unique_times)  # 1-based
+
+    new_channels = []
+    for ch in channels:
+        times_key = tuple(ch['times'])
+        ref = times_to_ref[times_key]
+        new_ch = {
+            'jointIndex': ch['jointIndex'],
+            'path': ch['path'],
+            'timeRef': ref,
+            'values': ch['values'],
+        }
+        new_channels.append(new_ch)
+
+    return unique_times, new_channels
+
+
 def write_anim_file(filepath, var_name, anim_names, all_animations):
-    """Write one Animation .luau file."""
+    """Write one Animation .luau file with sharedTimes factorization."""
     lines = []
     lines.append("--!strict")
     lines.append(f"-- {os.path.basename(filepath)}")
-    lines.append(f"-- Auto-generated by blender_to_rive.py v5.1")
+    lines.append(f"-- Auto-generated by blender_to_rive.py v6.0")
     lines.append(f"-- Animations: {', '.join(anim_names)}")
     lines.append("")
     lines.append(f"local {var_name} = {{}}")
@@ -979,17 +1155,28 @@ def write_anim_file(filepath, var_name, anim_names, all_animations):
             print(f"  WARNING: Animation '{anim_name}' not found, skipping")
             continue
         anim = all_animations[anim_name]
+
+        # Factorize times
+        shared_times, factorized_channels = factorize_shared_times(anim['channels'])
+
         lines.append(f'  ["{anim_name}"] = {{')
         lines.append(f'    name = "{anim["name"]}",')
         lines.append(f'    duration = {anim["duration"]},')
-        lines.append(f'    channels = {{')
 
-        for ch in anim['channels']:
-            times_str = ", ".join(fmt(t, 4) for t in ch['times'])
-            values_str = ", ".join(fmt(v, 6 if ch['path'] == 'rotation' else 4) for v in ch['values'])
-            lines.append(f'      {{jointIndex = {ch["jointIndex"]}, path = "{ch["path"]}", times = {{{times_str}}}, values = {{{values_str}}}}},')
-
+        # sharedTimes
+        lines.append(f'    sharedTimes = {{')
+        for st in shared_times:
+            times_str = ", ".join(fmt(t, 4) for t in st)
+            lines.append(f'      {{{times_str}}},')
         lines.append(f'    }},')
+
+        # Channels with timeRef
+        lines.append(f'    channels = {{')
+        for ch in factorized_channels:
+            values_str = ", ".join(fmt(v, 6 if ch['path'] == 'rotation' else 4) for v in ch['values'])
+            lines.append(f'      {{jointIndex = {ch["jointIndex"]}, path = "{ch["path"]}", timeRef = {ch["timeRef"]}, values = {{{values_str}}}}},')
+        lines.append(f'    }},')
+
         lines.append(f'  }},')
 
     lines.append("}")
@@ -1009,8 +1196,8 @@ def write_anim_file(filepath, var_name, anim_names, all_animations):
 
 def main():
     print("\n" + "=" * 70)
-    print("  BLENDER TO RIVE — Universal 3D Export v5.0")
-    print("  (Multi-Mesh + Posed Rest + Verified + Re-Export Mode)")
+    print("  BLENDER TO RIVE — Universal 3D Export v6.0")
+    print("  (Flat Arrays + sharedTimes + Atlas UV + Posed Rest)")
     print("=" * 70)
 
     # Step 0: Discover model
@@ -1023,23 +1210,23 @@ def main():
 
     # Step 1: Detect matrix_basis
     print("\n[1/8] Detecting matrix_basis residuals...")
-    use_posed_rest = detect_matrix_basis(armature)
+    detect_matrix_basis(armature)
 
     # Step 2: Build bone order + normalization
     print("\n[2/8] Building bone order & normalization...")
     bone_order = build_bone_order(armature)
     print(f"  Bone order: {len(bone_order)} bones")
-    normalize_mat, center, scale = compute_normalization(armature, mesh_objects)
+    normalize_mat, center, scale, depsgraph = compute_normalization(armature, mesh_objects)
 
     # Step 3: Export skeleton
-    print("\n[3/8] Exporting skeleton (posed rest)...")
+    print("\n[3/8] Exporting skeleton (posed rest: pose_bone.matrix)...")
     skeleton_data = export_skeleton(armature, bone_order, normalize_mat)
     print(f"  Joints: {skeleton_data['jointCount']}")
 
     # Step 4: Export all meshes
-    print("\n[4/8] Exporting meshes...")
-    all_verts, all_faces, all_skin, material_map = export_all_meshes(
-        armature, mesh_objects, bone_order, normalize_mat
+    print("\n[4/8] Exporting meshes (evaluated mesh, same depsgraph)...")
+    all_verts, all_faces, all_skin, material_map, zone_info = export_all_meshes(
+        armature, mesh_objects, bone_order, normalize_mat, depsgraph
     )
 
     # Step 5: Sort + fragment + factorize
@@ -1058,21 +1245,21 @@ def main():
     print("\n[7/8] Verifying...")
     verify_skeleton(skeleton_data, bone_order)
 
-    # Step 8: Write files
+    # Step 8: Write files (flat arrays + sharedTimes)
     print("\n[8/8] Writing files...")
 
     # Part files
     for i, part in enumerate(parts):
         suffix = chr(ord('A') + i)
-        var_name = f"{MODEL_NAME}Part{suffix}" if len(parts) > 1 else f"{MODEL_NAME}"
-        filename = f"{MODEL_NAME}Part{suffix}.luau"
+        var_name = f"{MODEL_NAME}Part{suffix}Data" if len(parts) > 1 else f"{MODEL_NAME}Data"
+        filename = f"{MODEL_NAME}Part{suffix}Data.luau" if len(parts) > 1 else f"{MODEL_NAME}Data.luau"
         filepath = os.path.join(OUTPUT_DIR, filename)
         skel = skeleton_data if i == 0 else None
         bo = bone_order if i == 0 else None
         write_part_file(filepath, var_name, part, skel, bo)
 
-    # Animation files — split into groups
-    anim_names = list(all_animations.keys())
+    # Animation files -- split into groups
+    anim_names = sorted(all_animations.keys())
     if ANIM_FILE_SPLIT:
         anim_groups = ANIM_FILE_SPLIT
     else:
@@ -1082,8 +1269,8 @@ def main():
 
     for gi, group in enumerate(anim_groups):
         num = gi + 1
-        var_name = f"{MODEL_NAME}Anim{num}"
-        filename = f"{MODEL_NAME}Anim{num}.luau"
+        var_name = f"{MODEL_NAME}Anim{num}Data"
+        filename = f"{MODEL_NAME}Anim{num}Data.luau"
         filepath = os.path.join(OUTPUT_DIR, filename)
         write_anim_file(filepath, var_name, group, all_animations)
 
@@ -1092,10 +1279,16 @@ def main():
     print("  EXPORT COMPLETE!")
     print("=" * 70)
     print(f"\n  Output: {OUTPUT_DIR}")
-    print(f"  Parts: {len(parts)} files")
+    print(f"  Parts: {len(parts)} files (~{MAX_FACES_PER_PART} faces/part)")
     print(f"  Animations: {len(anim_groups)} files ({len(anim_names)} clips)")
-    print(f"  Materials: {material_map}")
-    print(f"\n  Next: Copy .luau files to Rive project")
+    if material_map:
+        print(f"  Materials: {material_map}")
+    if zone_info:
+        print(f"  Color zones: {len(zone_info)}")
+        for cat, info in sorted(zone_info.items()):
+            print(f"    {cat}: {info['name']} ({info['count']} faces)")
+    print(f"\n  Data format: flat arrays (stride 3 verts, stride 4 faces) + sharedTimes")
+    print(f"  Next: Copy .luau files to Rive project")
     print(f"        Implement Node Script with anti-flickering (see CLAUDE.md)")
     print("")
 

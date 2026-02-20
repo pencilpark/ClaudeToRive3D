@@ -8,6 +8,12 @@ but it's duplicated inline for every channel. This script:
   2. Creates a `sharedTimes` field with those unique arrays
   3. Replaces each `times = {...}` with `timeRef = N` (1-based index)
 
+Savings: ~10% per animation file.
+
+NOTE: Only needed for Option A (blender_to_rive.py standalone export prior to v6.0).
+blender_to_rive.py v6.0+ generates sharedTimes directly.
+Option B (Blender MCP single-call) also generates sharedTimes directly.
+
 Idempotent: skips clips that already contain `timeRef`.
 
 Usage:

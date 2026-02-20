@@ -2,10 +2,16 @@
 """
 Convert Luau Part data files from table-of-tables format to flat arrays.
 
-Vertices: {x=N, y=N, z=N} → N, N, N,
-Faces: {verts = {a, b, c}, c = N} → a, b, c, N,
+Vertices: {x=N, y=N, z=N} -> N, N, N,  (stride 3)
+Faces: {verts = {a, b, c}, c = N} -> a, b, c, N,  (stride 4)
+
+Savings: ~60% file size reduction.
+
+NOTE: Only needed for Option A (blender_to_rive.py standalone export).
+Option B (Blender MCP single-call) generates flat arrays directly.
 
 Preserves everything else (skeleton, skinning, animations) unchanged.
+Idempotent: safe to re-run on already-converted files (no-op).
 
 Usage:
     python3 convert_flat.py                    # Auto-detect *Part*Data.luau files

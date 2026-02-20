@@ -74,11 +74,11 @@ Always use `--!strict` mode.
 
 ## CRITICAL RULES (Read Before Exporting)
 
-1. **ALWAYS use "posed rest" as reference** — NOT `bone.matrix_local` (pure REST). See "Posed Rest" section.
+1. **ALL static data in ONE single Blender MCP call** — Skeleton (IBMs + restPose), normalization bounds, and vertices MUST come from the SAME depsgraph state. The evaluated mesh is non-deterministic across separate `execute_blender_code` calls. Do everything in ONE call.
 2. **NEVER reset `matrix_basis`** before sampling animations — it IS the model's default pose.
 3. **ALWAYS prefer Blender MCP** over standalone Python scripts — more reliable.
 4. **Static models DON'T need Mesh3DUtil** — All math can be inline
-5. **Use flat arrays** for vertices (stride 3) and faces (stride 4) — ~33% smaller files
+5. **Use flat arrays** for vertices (stride 3) and faces (stride 4) — ~60% smaller files
 6. **Sort faces by avgZ** at export time for painter's algorithm
 7. **Extract only used vertices per part** — Prevents typecheck errors
 8. **Blender Z-up**: Yaw rotates in XY plane, NOT around Y axis
@@ -86,8 +86,10 @@ Always use `--!strict` mode.
 10. **Use anti-flickering method** — table.sort + index tiebreaker + depthBias
 11. **Use depthBias per Part file** — Large offsets (0, 10, 20) when parts are separate objects
 12. **Wall-mounted surfaces** — Hardcode in Node Script + depthBias to force draw order
-13. **Multi-zone coloring** — Assign Blender materials per zone, expose Input<Color> per zone
+13. **Multi-zone coloring** — Detect color zones from materials OR Atlas texture UV sampling (QUANT_STEP=0.005), expose `Input<Color>` per zone
 14. **Triangulate all meshes** — via bmesh at export time, not in Blender (preserves original)
+15. **NEVER assume single-material = single color** — Atlas textures encode multiple zones via UV; always sample texture at face UVs to identify zones
+16. **Depsgraph non-determinism** — `bpy.data.meshes.new_from_object(eval_obj)` returns DIFFERENT results across separate Blender MCP `execute_blender_code` calls (depsgraph state pollution). Solution: do EVERYTHING in ONE call.
 
 ---
 
@@ -112,21 +114,20 @@ https://forge.mograph.life/apps/lerp/api/drawing
 ```
 YOUR_MODEL/
 ├── Model.luau               # Main Node Script (rendering + Property Group)
-├── ModelPartAData.luau      # Part A: ~1900 faces max + skeleton data
-├── ModelPartBData.luau      # Part B: ~1900 faces max
-├── ModelPartCData.luau      # Part C: remaining faces (optional)
+├── ModelPartAData.luau      # Part A: ~2950 faces max + skeleton data
+├── ModelPartBData.luau      # Part B: ~2950 faces max (optional)
 ├── ModelAnim1Data.luau      # Animation data file 1 (split by size)
 ├── ModelAnim2Data.luau      # Animation data file 2 (optional)
 ├── Mesh3DUtil.luau          # 3D math utilities (for animated models)
 ├── SkeletalAnimUtil.luau    # Skeletal animation system
-├── blender_to_rive.py       # Universal export script
-├── convert_flat.py          # Convert data files to flat arrays (post-export optimization)
-├── convert_shared_times.py  # Factorize duplicate times arrays in animation files
+├── blender_to_rive.py       # Standalone export script (Option A)
+├── convert_flat.py          # Convert data files to flat arrays (post-export for Option A)
+├── convert_shared_times.py  # Factorize duplicate times arrays (post-export for Option A)
 ├── prompt.md                # AI agent prompt for Claude Code
 └── CLAUDE.md                # This documentation
 ```
 
-**File naming convention:** `{MODEL_NAME}Part{A,B,C,...}Data.luau` and `{MODEL_NAME}Anim{1,2,3,...}Data.luau`. Configure `MODEL_NAME` in `blender_to_rive.py` settings.
+**File naming convention:** `{MODEL_NAME}Part{A,B,C,...}.luau` and `{MODEL_NAME}Anim{1,2,3,...}.luau`. Configure `MODEL_NAME` in `blender_to_rive.py` settings.
 
 **Animations** are stored in separate files from Part data. Each animation file can contain multiple clips. Split across files if total size exceeds Rive limits.
 
@@ -135,17 +136,17 @@ YOUR_MODEL/
 ## Flat Array Data Format (Optimized)
 
 ### Why Flat Arrays
-Table-of-tables format (`{x=N, y=N, z=N}`) adds ~33% overhead from repeated key names and braces. Flat arrays store raw numbers with implicit structure defined by stride.
+Table-of-tables format (`{x=N, y=N, z=N}`) adds ~60% overhead from repeated key names and braces. Flat arrays store raw numbers with implicit structure defined by stride.
 
 ### Vertex Format (stride = 3)
 ```luau
--- OLD (verbose): ~33% larger
+-- OLD (verbose): ~60% larger
 ModelData.vertices = {
   {x = 10.825, y = -18.875, z = -1.141},
   {x = 11.296, y = -19.324, z = 1.685},
 }
 
--- NEW (flat): stride 3 → x, y, z, x, y, z, ...
+-- NEW (flat): stride 3 -> x, y, z, x, y, z, ...
 ModelData.vertices = {
   10.825, -18.875, -1.141,
   11.296, -19.324, 1.685,
@@ -169,7 +170,7 @@ ModelData.faces = {
   {verts = {4151, 4150, 4153}, c = 1},
 }
 
--- NEW (flat): stride 4 → v1, v2, v3, category, v1, v2, v3, category, ...
+-- NEW (flat): stride 4 -> v1, v2, v3, category, v1, v2, v3, category, ...
 ModelData.faces = {
   4150, 4151, 4152, 1,
   4151, 4150, 4153, 1,
@@ -188,7 +189,8 @@ local faceCount = #faces / 4
 ### Performance Benefits
 - Direct index assignment `result[base + 1] = sx` instead of `table.insert(result, {x=sx, ...})`
 - Triangles are always 3 vertices — unroll the face loop instead of ipairs
-- ~33% file size reduction across all Part data files
+- ~60% file size reduction across all Part data files
+- With flat arrays, MAX_FACES_PER_PART increases from ~1900 to ~2950
 
 ### Converting Existing Files
 Use `convert_flat.py` to convert table-of-tables format to flat arrays:
@@ -231,7 +233,9 @@ channels = {
 
 ## Universal Export Process (10 Steps)
 
-**Proven on:** 15+ meshes, 43+ bones, 14+ animations, 5664+ faces, 9300+ vertices — any model follows the same steps.
+**Proven on:** FinnTheFrog (1 mesh, 13 bones, 17 animations, 5846 faces), PIO Robot (15 meshes, 43 bones, 14 animations, 5664 faces) — any model follows the same steps.
+
+**CRITICAL: Steps 4-8 MUST run in ONE single `execute_blender_code` call** to ensure consistent depsgraph state. The evaluated mesh is NON-DETERMINISTIC across separate calls.
 
 ### Step 1: Discover Model
 ```python
@@ -239,7 +243,8 @@ channels = {
 # - The armature (first object of type 'ARMATURE')
 # - All mesh children (exclude non-mesh, cameras, empties, etc.)
 # - Parent type per mesh: BONE (rigid) vs ARMATURE modifier (multi-bone skinning)
-# - Materials across all meshes (sorted alphabetically -> category indices 1..N)
+# - Color zones: multiple materials (sorted alphabetically -> category 1..N)
+#   OR single Atlas material -> UV-sample texture per face -> cluster into zones
 # - Total vertex/polygon count
 
 armature = None
@@ -256,7 +261,8 @@ mesh_objects = [
 
 ### Step 2: Detect `matrix_basis` Residuals (ALWAYS FIRST)
 ```python
-# Determines whether to use "posed rest" (most models) or "pure rest"
+# Detects whether bones have a "default pose" different from pure rest.
+# If residuals exist, the posed rest is different from pure rest.
 armature.animation_data.action = None
 armature.data.pose_position = 'POSE'
 bpy.context.view_layer.update()
@@ -267,7 +273,7 @@ for pb in armature.pose.bones:
     if loc.length > 0.0001 or abs(rot.w - 1.0) + abs(rot.x) + abs(rot.y) + abs(rot.z) > 0.001:
         non_identity += 1
 
-# If ANY bone has residual matrix_basis -> MUST use "posed rest" for ALL exports
+# Residuals are normal — the animation system handles them via ABSOLUTE transforms
 ```
 
 ### Step 3: Build Bone Order
@@ -285,32 +291,34 @@ for root in sorted(armature.data.bones, key=lambda b: b.name):
         dfs(root)
 ```
 
-### Step 4: Compute Normalization (in POSED REST)
+### Step 4: Compute Normalization (from EVALUATED mesh)
 ```python
-# CRITICAL: Bounding box from ALL meshes in POSED REST position
-armature.animation_data.action = None
-armature.data.pose_position = 'POSE'
-bpy.context.view_layer.update()
+# Use evaluated mesh for bounds — includes matrix_basis effects (e.g. foot positions)
+# MUST be in the SAME execute_blender_code call as Steps 5-8
+depsgraph = bpy.context.evaluated_depsgraph_get()
 
-# Gather all vertices across all meshes in world space
-for obj in mesh_objects:
-    for v in obj.data.vertices:
-        world_pos = obj.matrix_world @ v.co  # Follows posed bones
+for mesh_obj in mesh_objects:
+    eval_obj = mesh_obj.evaluated_get(depsgraph)
+    eval_mesh = bpy.data.meshes.new_from_object(eval_obj)
+    for v in eval_mesh.vertices:
+        world_pos = mesh_obj.matrix_world @ v.co
         update_bounds(world_pos)
+    bpy.data.meshes.remove(eval_mesh)
 
 center = (min_coord + max_coord) / 2
 scale_factor = TARGET_SIZE / max_dimension  # TARGET_SIZE = 200
 normalize_mat = Matrix.Scale(scale_factor, 4) @ Matrix.Translation(-center)
 ```
 
-### Step 5: Export Skeleton (from POSED REST)
+### Step 5: Export Skeleton (from POSED REST — `pose_bone.matrix`)
 ```python
-# Use pose_bone.matrix (includes matrix_basis), NOT bone.matrix_local
+# Use pose_bone.matrix (POSED REST) — includes matrix_basis effects
+# MUST be in the SAME call as normalization + vertices
 arm_world = armature.matrix_world
 
 for bone_name in bone_order:
     pose_bone = armature.pose.bones[bone_name]
-    bone_world = arm_world @ pose_bone.matrix    # <- NOT bone.matrix_local!
+    bone_world = arm_world @ pose_bone.matrix     # <- POSED REST
     bone_normalized = normalize_mat @ bone_world
     loc, rot, _ = bone_normalized.decompose()
     bone_mat = Matrix.LocRotScale(loc, rot, Vector((1,1,1)))  # Force scale=1
@@ -320,8 +328,9 @@ for bone_name in bone_order:
 
 ### Step 6: Export Meshes (Vertices + Faces + Skinning)
 ```python
-# For each mesh object:
-# 1. Get evaluated mesh (applies modifiers) or use original
+# Use EVALUATED mesh — same depsgraph as normalization + skeleton
+# MUST be in the SAME call as Steps 4-5
+# 1. Get evaluated mesh
 # 2. Triangulate via bmesh (non-destructive - only temporary mesh)
 # 3. Transform vertices: normalize_mat @ obj.matrix_world @ v.co
 # 4. Store as flat array: x, y, z, x, y, z, ...
@@ -330,21 +339,23 @@ for bone_name in bone_order:
 #    - BONE parent -> all verts assigned to parent bone (rigid)
 #    - ARMATURE modifier -> read vertex groups (multi-bone weights, up to 4 per vert)
 
-# Triangulation (non-destructive):
+eval_obj = mesh_obj.evaluated_get(depsgraph)
+eval_mesh = bpy.data.meshes.new_from_object(eval_obj)
 bm = bmesh.new()
-bm.from_mesh(mesh_data)
+bm.from_mesh(eval_mesh)
 bmesh.ops.triangulate(bm, faces=bm.faces[:])
 tri_mesh = bpy.data.meshes.new("_temp_tri")
 bm.to_mesh(tri_mesh)
 bm.free()
 # ... export from tri_mesh ...
-bpy.data.meshes.remove(tri_mesh)  # Cleanup
+bpy.data.meshes.remove(tri_mesh)
+bpy.data.meshes.remove(eval_mesh)
 ```
 
 ### Step 7: Sort & Fragment
 ```python
 # 1. Sort ALL faces (from all meshes combined) by avgZ - painter's algorithm
-# 2. Split into parts of ~MAX_FACES_PER_PART faces each
+# 2. Split into parts of ~MAX_FACES_PER_PART faces each (~2950 with flat arrays)
 # 3. Each part gets ONLY its used vertices (remapped indices starting at 1)
 # 4. Each part gets its own factorized skinning data
 # 5. Output vertices and faces as flat arrays
@@ -357,6 +368,7 @@ parts = [all_faces[i:i+MAX_FACES] for i in range(0, len(all_faces), MAX_FACES)]
 ```python
 # DO NOT reset matrix_basis before sampling!
 # Animations are ABSOLUTE (not deltas from rest pose)
+# MUST use the SAME normalize_mat from Step 4
 
 for action in actions:
     armature.animation_data.action = action
@@ -379,10 +391,10 @@ for action in actions:
 ### Step 9: Optimize Animation Channels
 ```python
 # Three outcomes per bone per path (translation, rotation):
-#   1. Constant AND matches posed-rest -> REMOVE (safe)
-#   2. Constant but DIFFERS from posed-rest -> KEEP as 2-keyframe
+#   1. Constant AND matches rest pose -> REMOVE (safe)
+#   2. Constant but DIFFERS from rest pose -> KEEP as 2-keyframe
 #   3. Varies across frames -> KEEP full channel
-EPSILON = 0.0001
+EPSILON = 0.0005
 ```
 
 ### Step 10: Verify & Write Files
@@ -392,54 +404,73 @@ EPSILON = 0.0001
 # 1. Skin matrices = Identity at posed rest (max deviation < 0.001)
 for i in range(joint_count):
     skin = world_mats[i] @ ibms[i]
-    deviation = max(abs(skin[r][c] - identity[r][c]) for r, c in itertools.product(range(4), range(4)))
+    deviation = max(abs(skin[r][c] - identity[r][c]) for r, c in ...)
     assert deviation < 0.001
 
 # 2. Write Part files (skeleton in first part only)
 #    - Vertices as flat arrays (stride 3)
 #    - Faces as flat arrays (stride 4)
 # 3. Write Animation files (split by ANIM_FILE_SPLIT or auto-split)
+#    - sharedTimes factorized per clip
 ```
 
 ---
 
-## CRITICAL: "Posed Rest" vs "Pure Rest" (THE #1 EXPORT TRAP)
+## CRITICAL: The Single-Call Rule (THE #1 EXPORT TRAP)
 
-### Problem
-Many Blender models have a `matrix_basis` residual on pose bones — a "default pose" (arms down, fingers closed, legs bent) that is NOT the rest pose. This residual persists even with NO action assigned.
+### The Two Spaces in Blender
+- **PURE REST** (`bone.matrix_local`, `mesh_obj.data`): The raw rest pose data, deterministic, always the same.
+- **POSED REST** (`pose_bone.matrix`, evaluated mesh): Includes `matrix_basis` residuals. Deterministic **within one `execute_blender_code` call**, but NON-DETERMINISTIC across separate calls.
 
-### Why It Matters
-If you use `bone.matrix_local` (pure REST) for the skeleton but `pose_bone.matrix` (which includes `matrix_basis`) for animations, you get a **coordinate space mismatch**. A tiny difference in Blender gets amplified by `armature.matrix_world` (often scale=100) x `normalize_mat` (scale ~30-50) = **massive offset** in normalized space.
+### The Problem: Depsgraph Non-Determinism
+`bpy.data.meshes.new_from_object(eval_obj)` returns **different results across separate Blender MCP `execute_blender_code` calls** due to depsgraph state pollution/caching. If Part files get one normalization and Animation files get another, the model is OK at rest but **explodes during animation**.
 
-### The Rule
-**Skeleton, vertices, and animations must ALL use the SAME reference pose = "posed rest".**
-
-**"Posed Rest"** = armature with NO action assigned, `pose_position='POSE'`, `matrix_basis` applied naturally. This IS the model's actual default appearance.
+### The Rule: EVERYTHING in ONE Call
+**Skeleton IBMs, normalization bounds, vertices, AND animations MUST all come from the SAME `execute_blender_code` call:**
 
 ```python
-# CORRECT: Use "posed rest" for EVERYTHING
-armature.animation_data.action = None
-armature.data.pose_position = 'POSE'       # matrix_basis applies
-bpy.context.view_layer.update()
+# ONE single execute_blender_code call:
+depsgraph = bpy.context.evaluated_depsgraph_get()
 
-bone_world = arm_world @ pose_bone.matrix  # Includes matrix_basis
-vertex_world = obj.matrix_world @ v.co     # obj.matrix_world follows posed bones
+# Step 4: Normalization from evaluated mesh
+for mesh_obj in mesh_objects:
+    eval_obj = mesh_obj.evaluated_get(depsgraph)
+    eval_mesh = bpy.data.meshes.new_from_object(eval_obj)
+    # ... compute bounds ...
 
-# WRONG: Using pure REST for skeleton
-armature.data.pose_position = 'REST'       # Uses bone.matrix_local
-# -> IBMs won't match pose_bone.matrix during animation -> huge offset
+# Step 5: Skeleton from pose_bone.matrix (same depsgraph)
+for bone_name in bone_order:
+    pose_bone = armature.pose.bones[bone_name]
+    bone_world = arm_world @ pose_bone.matrix   # POSED REST
+    # ...
+
+# Step 6: Vertices from evaluated mesh (same depsgraph)
+for mesh_obj in mesh_objects:
+    eval_obj = mesh_obj.evaluated_get(depsgraph)
+    eval_mesh = bpy.data.meshes.new_from_object(eval_obj)
+    # ... same normalization applied ...
+
+# Step 8: Animations with same normalize_mat
+# ... all in the same call ...
 ```
 
+### Why NOT Pure REST
+Pure REST (`bone.matrix_local` + `mesh_obj.data`) is deterministic across calls, but:
+- The **restPose** (local transforms capturing the model's default appearance) must also be from Pure REST (`bone.matrix_local` chain). If you mix Pure REST IBMs with Posed REST restPose (`pose_bone.matrix` chain), `skinMatrix != Identity` and the model collapses.
+- Pure REST doesn't include `matrix_basis` effects — bones that have a "default pose" (e.g., arms down instead of T-pose) won't be captured.
+
+**Bottom line:** Use POSED REST for everything in ONE call. It's simpler and proven.
+
 ### Verification
-At posed rest (no action), `skinMatrix = worldMatrix x IBM` must equal **Identity** for all bones. Max acceptable deviation: 0.001. If deviation > 1.0, there is a coordinate space mismatch.
+At rest pose (no action), `skinMatrix = worldMatrix x IBM` must equal **Identity** for all bones. Max acceptable deviation: 0.001. If deviation > 1.0, there is a coordinate space mismatch.
 
 ### Why NEVER Reset `matrix_basis`
 `matrix_basis` IS the model's default pose — NOT an animation artifact. If you reset it before sampling, bones without keyframes in the current action snap to pure REST instead of their intended default position (arms horizontal, fingers open, etc.).
 
-### Why Static Channel Optimization Must Compare Against Posed Rest
+### Why Static Channel Optimization Must Compare Against Rest Pose
 When removing constant animation channels:
-- Remove if constant AND matches **posed rest** (epsilon 0.0001) — bone stays at default
-- Keep as 2-keyframe if constant but **differs from posed rest** — bone needs this value
+- Remove if constant AND matches **rest pose** values in the skeleton (epsilon 0.0001) — bone stays at default
+- Keep as 2-keyframe if constant but **differs from rest pose** — bone needs this value
 - NEVER remove just because constant between frames — may be constant at a non-default value!
 
 ---
@@ -577,10 +608,10 @@ def resample_channel(source_times, source_values, target_times, stride):
 ## Animation System Format
 
 ### Data Format
-**All data is in the SAME normalized coordinate space:**
-- **Vertices:** Flat array (stride 3), centered, scaled to ~200 units max, in posed rest position
-- **IBMs:** From posed rest (`pose_bone.matrix`), scale forced to 1
-- **Rest pose:** Local transforms from posed rest, scale = `{1, 1, 1}`
+**All data is in the SAME normalized coordinate space (~200 units max):**
+- **Vertices:** Flat array (stride 3), centered, scaled, from evaluated mesh
+- **IBMs:** From `pose_bone.matrix` (POSED REST), scale forced to 1
+- **Rest pose:** Local transforms capturing the model's default appearance
 - **Animations:** **ABSOLUTE** local transforms per keyframe (NOT deltas)
 
 **Quaternion format:** WXYZ in data files (Blender native: `{w, x, y, z}`).
@@ -635,12 +666,12 @@ All meshes are triangulated at export via `bmesh.ops.triangulate()`. This is **n
 ### Limits
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Max faces/file | **~1900** | With flat face format (stride 4) |
-| Max vertices/file | **~2500** | With vertex optimization per part |
+| Max faces/file | **~2950** | With flat face format (stride 4) |
+| Max vertices/file | **~3600** | With vertex optimization per part |
 
 ### Flat Array Format (Primary Optimization)
 ```luau
--- OLD: Verbose table-of-tables (~33% larger)
+-- OLD: Verbose table-of-tables (~60% larger)
 ModelData.vertices = { {x=10, y=20, z=30}, ... }
 ModelData.faces = { {verts={1,2,3}, c=1}, ... }
 
@@ -723,7 +754,7 @@ processFaces(self, screenVerts, screenFaces, ..., 100)
 
 #### 3. Stable Sort with Index Tiebreaker
 ```luau
-local Z_EPSILON = 0.001
+local Z_EPSILON = 0.005
 table.sort(faces, function(a: ProjectedFace, b: ProjectedFace): boolean
     local depthDiff = a.depth - b.depth
     if math.abs(depthDiff) < Z_EPSILON then
@@ -736,8 +767,8 @@ end)
 ### Recommended Values
 | Parameter | Value | When |
 |-----------|-------|------|
-| Z_EPSILON | 0.001 | Always |
-| depthBias (Z-sliced) | 0, 0, 0 | Parts = faces sorted by avgZ |
+| Z_EPSILON | 0.005 | Always |
+| depthBias (Z-sliced) | 0, 0 | Parts = faces sorted by avgZ |
 | depthBias (separate objects) | 0, 10, 20 | Parts = distinct mesh objects |
 | depthBias (wall overlay) | 99, 100 | Must draw on top |
 | faceExpansion | 0.05 | Always |
@@ -747,21 +778,72 @@ end)
 
 ## Multi-Zone Coloring
 
-1. **In Blender:** Create one material per zone (e.g., M_Body, M_Head, M_Arms)
+Color zones can be detected via **two methods** — always try both:
+
+### Method A: Multiple Materials (Explicit Zones)
+1. **In Blender:** One material per zone (e.g., M_Body, M_Head, M_Arms)
 2. **Assign materials** to faces
 3. **Export** — each material becomes category `1..N` (sorted alphabetically)
-4. **In Node Script:** Expose `Input<Color>` per zone, build colorMap
+
+### Method B: Atlas Texture UV Sampling (Single Material, Multiple Colors)
+Many models use a **single "Atlas" material** with a small texture (e.g., 32x32) where different UV regions map to different colors. Vertex colors may all be white (just a multiplier).
+
+**Detection (Step 1):**
+```python
+# Check: 1 material but texture exists?
+mat = mesh.materials[0]
+for node in mat.node_tree.nodes:
+    if node.type == 'TEX_IMAGE' and node.image:
+        # Atlas texture found -> sample per-face colors from UV
+```
+
+**Sampling per-face colors:**
+```python
+img = tex_node.image
+pixels = list(img.pixels)  # RGBA flat array
+w, h = img.size
+
+for poly in mesh.polygons:
+    r_sum, g_sum, b_sum = 0, 0, 0
+    for li in poly.loop_indices:
+        uv = uv_layer.data[li].uv
+        px = int(uv.x * w) % w
+        py = int(uv.y * h) % h
+        idx = (py * w + px) * 4
+        r_sum += pixels[idx]
+        g_sum += pixels[idx + 1]
+        b_sum += pixels[idx + 2]
+    n = len(poly.loop_indices)
+    face_color = (r_sum/n, g_sum/n, b_sum/n)  # Linear 0-1
+```
+
+**Clustering into zones:**
+```python
+# Quantize to step=0.005 (NOT 0.02 — too aggressive, merges similar grays)
+# Each unique quantized color = one zone
+# Assign category 1..N (sorted alphabetically by zone name)
+# Name zones by their visual appearance: Green, Orange, DarkGray, etc.
+QUANT_STEP = 0.005  # Fine-grained to preserve distinct zones
+```
+
+### Both Methods -> Same Output
+Regardless of detection method, the result is the same:
+- Each face gets a **category** `1..N` in the flat face array
+- Node Script exposes **one `Input<Color>` per zone**
+- `getTintColor(self, category)` maps category -> color
 
 ```luau
-local colorMap: { [number]: Color } = {
-    [1] = self.bodyColor,
-    [2] = self.headColor,
-    [3] = self.armsColor,
-}
+local function getTintColor(self: Model3D, category: number): Color
+    if category == 1 then return self.darkGrayColor
+    elseif category == 2 then return self.greenColor
+    elseif category == 3 then return self.orangeColor
+    end
+    return self.greenColor  -- fallback
+end
 
 -- In processFaces, read category from flat face array:
 local category = faces[fBase + 4]
-local faceColor = colorMap[category] or self.bodyColor
+local baseColor = getTintColor(self, category)
 ```
 
 ---
@@ -892,7 +974,7 @@ local arr: { number } = {}
 ```
 
 ### Constructor MUST Mirror ALL Type Fields
-When defining a type with fields, the `return function()` constructor object MUST include ALL fields with initial values. Missing fields → `nil` at runtime → crash.
+When defining a type with fields, the `return function()` constructor object MUST include ALL fields with initial values. Missing fields -> `nil` at runtime -> crash.
 ```luau
 type Model3D = {
     projectedFaces: { ProjectedFace },
@@ -994,86 +1076,6 @@ end
 
 ---
 
-## processFaces (Flat Array Version)
-
-```luau
-local function processFaces(
-    self: Model3D,
-    vertices: { number },     -- Flat: x,y,z,x,y,z,...
-    faces: { number },        -- Flat: v1,v2,v3,cat,v1,v2,v3,cat,...
-    ax: number, ay: number, az: number,
-    cosX: number, sinX: number,
-    cosY: number, sinY: number,
-    cosZ: number, sinZ: number,
-    scaleFactor: number,
-    fov: number, cameraDistance: number, usePerspective: boolean,
-    brightness: number, faceExpansion: number, backfaceCulling: boolean,
-    depthBias: number?
-)
-    local bias = depthBias or 0
-    local faceCount = #faces / 4
-
-    for fi = 0, faceCount - 1 do
-        local fBase = fi * 4
-        local vi1 = faces[fBase + 1]
-        local vi2 = faces[fBase + 2]
-        local vi3 = faces[fBase + 3]
-        local category = faces[fBase + 4]
-
-        -- Read vertices from flat array
-        local b1 = (vi1 - 1) * 3
-        local b2 = (vi2 - 1) * 3
-        local b3 = (vi3 - 1) * 3
-
-        local tx1, ty1, tz1 = transformVertex(
-            vertices[b1 + 1] * scaleFactor, vertices[b1 + 2] * scaleFactor, vertices[b1 + 3] * scaleFactor,
-            ax, ay, az, cosX, sinX, cosY, sinY, cosZ, sinZ
-        )
-        local tx2, ty2, tz2 = transformVertex(
-            vertices[b2 + 1] * scaleFactor, vertices[b2 + 2] * scaleFactor, vertices[b2 + 3] * scaleFactor,
-            ax, ay, az, cosX, sinX, cosY, sinY, cosZ, sinZ
-        )
-        local tx3, ty3, tz3 = transformVertex(
-            vertices[b3 + 1] * scaleFactor, vertices[b3 + 2] * scaleFactor, vertices[b3 + 3] * scaleFactor,
-            ax, ay, az, cosX, sinX, cosY, sinY, cosZ, sinZ
-        )
-
-        local avgZ = (tz1 + tz2 + tz3) / 3 + bias
-
-        -- ... normal calculation, backface culling, lighting, projection, path building ...
-        -- Use category to look up color: colorMap[category]
-    end
-end
-```
-
----
-
-## Bounding Box from Flat Vertices
-
-```luau
--- In init(), compute bounding box from flat vertex arrays
-local allVerts = {
-    (PartAData :: any).vertices :: { number },
-    (PartBData :: any).vertices :: { number },
-    (PartCData :: any).vertices :: { number },
-}
-local minX, minY, minZ = math.huge, math.huge, math.huge
-local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
-for _, verts in ipairs(allVerts) do
-    for i = 1, #verts, 3 do
-        local vx, vy, vz = verts[i], verts[i + 1], verts[i + 2]
-        minX = math.min(minX, vx)
-        minY = math.min(minY, vy)
-        minZ = math.min(minZ, vz)
-        maxX = math.max(maxX, vx)
-        maxY = math.max(maxY, vy)
-        maxZ = math.max(maxZ, vz)
-    end
-end
-```
-
----
-
 ## Export Workflow
 
 ### Option A: blender_to_rive.py (Standalone Script)
@@ -1092,9 +1094,10 @@ end
 ### Option B: Claude Code + Blender MCP (Preferred)
 1. Connect Blender MCP
 2. Claude analyzes the model (meshes, bones, materials, vertex count)
-3. Claude runs the 10-step export logic via Python in Blender
-4. Claude generates the `.luau` files directly (with flat arrays)
-5. Claude verifies the output (skin matrices, vertex roundtrip)
+3. Claude runs Steps 4-10 in ONE single `execute_blender_code` call
+4. Claude generates the `.luau` files directly (with flat arrays + sharedTimes)
+5. Claude verifies the output (skin matrices = Identity)
+6. Claude updates the Node Script if part count changes
 
 Both produce the same output format.
 
@@ -1104,11 +1107,12 @@ Both produce the same output format.
 
 | Issue | Cause | Solution |
 |-------|-------|----------|
-| **Body parts dislocated/scattered** | **Different reference poses for skeleton vs vertices vs animations** | **Use "posed rest" for ALL exports** |
-| **Head/shoulders offset** | **Skeleton uses pure REST, animations use posed REST** | **Use `pose_bone.matrix`, not `bone.matrix_local`** |
+| **Model collapses into star/spikes** | **IBMs and restPose from different coordinate spaces** | **Use same source (pose_bone.matrix) for BOTH, in ONE call** |
+| **Model explodes during animation only** | **Part files and Anim files have different normalization** | **Everything in ONE `execute_blender_code` call** |
 | **Arms horizontal / T-pose in Idle** | **`matrix_basis` reset or static channels removed** | **NEVER reset matrix_basis; keep constant-but-different channels** |
 | **Huge offset on root bone** | **`matrix_basis` x armature_scale x normalize_scale** | **Detect matrix_basis residuals first (Step 2)** |
 | **Bones snap to wrong pose** | **Action lacks keyframes, matrix_basis was reset** | **Keep matrix_basis; posed-rest covers default** |
+| **Feet/limbs dislocated from body** | **Bounds and vertices from different spaces** | **Bounds + vertices + skeleton all from SAME call** |
 | Faces flickering | Z-fighting from coplanar faces | 3-technique anti-flickering |
 | Flickering between Parts | Parts compete for same depth | depthBias: 0/10/20 or 0/0/0 |
 | Screen flickers on wall | Coplanar with wall | Hardcode + depthBias=100 |
@@ -1122,6 +1126,7 @@ Both produce the same output format.
 | Non-triangular faces | Quads/ngons in mesh | Triangulate via bmesh at export |
 | `StructRNA removed` error | Evaluated mesh freed too early | Use separate temp mesh for bmesh |
 | Colors all same | Not reading category from flat array | `faces[fBase + 4]` for category |
+| **All faces one color despite texture** | **Atlas UV sampling QUANT_STEP too large** | **Use QUANT_STEP=0.005, not 0.02** |
 | **Fingers stretched/distorted on re-export** | **Quaternion sign ambiguity in rest local decomposition** | **Detect mismatched bones (dot < 0.95), use `matrix_basis` delta** |
 | **Re-export produces different results** | **`decompose()` yields different quaternions across sessions** | **Three-tier hybrid sampling (see Quaternion Sign Ambiguity section)** |
 | **Body frozen during partial animation** | **Only head/hands animated, rest receives rest pose** | **Animation composition: merge Idle channels with targeted animation** |
@@ -1132,16 +1137,18 @@ Both produce the same output format.
 
 ## Pre-Export Checklist
 
-- [ ] **Step 2: `matrix_basis` check** — detect residuals, determine posed-rest mode
+- [ ] **Step 2: `matrix_basis` check** — detect residuals
 - [ ] Model analyzed (meshes, vertex/polygon count, materials, parent types)
-- [ ] **Normalization computed in POSED REST** (all meshes combined)
-- [ ] **Skeleton IBMs from posed rest** (`pose_bone.matrix`)
-- [ ] **Vertices exported in posed rest** (`pose_position='POSE'`, no action)
+- [ ] **ALL static data in ONE call** (normalization + skeleton + vertices + animations)
+- [ ] Normalization from evaluated mesh bounds
+- [ ] Skeleton IBMs from `pose_bone.matrix` (POSED REST)
+- [ ] Vertices from evaluated mesh (same depsgraph)
 - [ ] **Meshes triangulated** (via bmesh, non-destructive)
 - [ ] **Animations sampled WITHOUT resetting `matrix_basis`**
-- [ ] **Static channels compared against POSED REST**
+- [ ] **Static channels compared against rest pose**
 - [ ] **Verification: skin matrices = Identity** (deviation < 0.001)
-- [ ] Materials -> category indices (alphabetical)
+- [ ] **Color zones detected**: multi-material (alphabetical) OR Atlas texture UV sampling (QUANT_STEP=0.005)
+- [ ] Materials / texture zones -> category indices `1..N`
 - [ ] **Flat arrays**: vertices stride 3, faces stride 4
 - [ ] Faces sorted by avgZ before fragmenting
 - [ ] Each part has only its used vertices (remapped indices)
@@ -1149,6 +1156,7 @@ Both produce the same output format.
 - [ ] **ABSOLUTE local transforms** (not deltas)
 - [ ] **WXYZ quaternions** in data files
 - [ ] **1-based joint indices** in data files
+- [ ] **sharedTimes** factorized in animation files
 - [ ] `context:markNeedsUpdate()` for auto-rotation/animation
 - [ ] Yaw rotates in XY plane (Z-up)
 - [ ] **Anti-flickering**: index field + depthBias + Z_EPSILON sort

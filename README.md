@@ -39,11 +39,11 @@ This pipeline allows you to:
 
 **Key Features:**
 - Automatic mesh normalization (~200 units)
-- Automatic fragmentation for large meshes (~1900 faces per part)
+- Automatic fragmentation for large meshes (~2950 faces per part with flat arrays)
 - Multiple animation support with runtime switching
 - Full skeletal animation with vertex skinning
 - Customizable material colors via Property Group
-- **Optimized flat array format** for vertices and faces (~33% file size reduction)
+- **Optimized flat array format** for vertices and faces (~60% file size reduction)
 - **Factorized skinning** (patterns + index, ~40% smaller)
 - **Blender MCP integration** for AI-assisted conversion
 
@@ -68,7 +68,7 @@ This pipeline allows you to:
 # Edit MODEL_NAME in blender_to_rive.py, then run with Alt+P
 
 # 2. Optimize data files
-python3 convert_flat.py           # Flat arrays (~33% smaller)
+python3 convert_flat.py           # Flat arrays (~60% smaller)
 python3 convert_shared_times.py   # Shared time arrays (~10% smaller)
 
 # 3. Copy generated files to your Rive project
@@ -183,7 +183,7 @@ Open `blender_to_rive.py` and edit:
 MODEL_NAME = "YourModel"       # Output file prefix
 TARGET_SIZE = 200.0            # Normalize to ~200 units
 OUTPUT_DIR = "//"              # Output directory
-MAX_FACES_PER_PART = 1900     # Auto-fragment threshold
+MAX_FACES_PER_PART = 2950     # Auto-fragment threshold (flat arrays)
 ```
 
 #### Step 4: Run the Export
@@ -196,7 +196,7 @@ MAX_FACES_PER_PART = 1900     # Auto-fragment threshold
 #### Step 5: Optimize Data Files
 
 ```bash
-python3 convert_flat.py           # Vertices/faces → flat arrays (~33% smaller)
+python3 convert_flat.py           # Vertices/faces -> flat arrays (~60% smaller)
 python3 convert_shared_times.py   # Factorize duplicate times in animations (~10% smaller)
 ```
 
@@ -235,7 +235,7 @@ project/
 
 ### Flat Arrays (Optimized)
 
-Vertices and faces use **flat number arrays** for ~33% smaller file sizes:
+Vertices and faces use **flat number arrays** for ~60% smaller file sizes:
 
 ```luau
 -- Vertices: flat array, stride 3 (x, y, z per vertex)
@@ -312,7 +312,7 @@ ModelData.animations = {
 | `MODEL_NAME` | "Model" | Output file prefix |
 | `TARGET_SIZE` | 200.0 | Normalize mesh to this size |
 | `OUTPUT_DIR` | "//" | Output directory (// = relative to .blend) |
-| `MAX_FACES_PER_PART` | 1900 | Fragment threshold for faces |
+| `MAX_FACES_PER_PART` | 2950 | Fragment threshold for faces (flat arrays) |
 
 ### convert_flat.py
 
@@ -445,7 +445,7 @@ SkelAnim.blendAnimations(skeleton, clipA, clipB, timeA, timeB, blendFactor)
 
 For better performance:
 - Reduce polygon count in Blender (decimate modifier)
-- Use flat arrays (`convert_flat.py`) for ~33% smaller data files
+- Use flat arrays (`convert_flat.py`) for ~60% smaller data files
 - Factorize animation times (`convert_shared_times.py`) for ~10% smaller animation files
 - Use orthographic projection (`usePerspective = false`)
 - Keep `brightness` calculation simple
@@ -454,12 +454,14 @@ For better performance:
 
 ## Critical Rules Summary
 
-1. **Coordinate Space Consistency**: ALL data (vertices, IBMs, rest pose, animations) must use the SAME normalized space ("posed rest")
-2. **Scale = 1**: Always force scale to 1 on bone matrices
-3. **Quaternion Format**: Blender exports WXYZ, SkeletalAnimUtil converts to XYZW automatically
-4. **Animation Format**: Store FINAL local transforms, not deltas
-5. **Flat Arrays**: Vertices stride 3, faces stride 4 for optimal file size
-6. **Rive Restrictions**: Type annotations on `table.sort`, no `path:reset()` in `draw()`, NO `table.create()` (Roblox-only), constructor must mirror ALL type fields
+1. **Single-Call Rule**: ALL static data (skeleton IBMs, normalization bounds, vertices) MUST come from the SAME `execute_blender_code` call. The evaluated mesh is non-deterministic across separate calls (depsgraph state pollution).
+2. **Coordinate Space Consistency**: ALL data (vertices, IBMs, rest pose, animations) must use the SAME normalized space ("posed rest" via `pose_bone.matrix` + evaluated mesh)
+3. **Scale = 1**: Always force scale to 1 on bone matrices
+4. **Quaternion Format**: Blender exports WXYZ, SkeletalAnimUtil converts to XYZW automatically
+5. **Animation Format**: Store FINAL local transforms (ABSOLUTE), not deltas. NEVER reset `matrix_basis`.
+6. **Atlas UV Sampling**: Use QUANT_STEP=0.005 (not 0.02) to preserve distinct color zones
+7. **Flat Arrays**: Vertices stride 3, faces stride 4 for ~60% file size reduction
+8. **Rive Restrictions**: Type annotations on `table.sort`, no `path:reset()` in `draw()`, NO `table.create()` (Roblox-only), constructor must mirror ALL type fields
 
 ---
 
