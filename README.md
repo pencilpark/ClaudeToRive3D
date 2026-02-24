@@ -69,15 +69,15 @@ python3 convert_shared_times.py   # Shared time arrays (~10% smaller)
 ### For Blender MCP Method
 - **Claude Code** with Blender MCP installed
 - **Blender 3.0+** running with MCP connection
-- Model with Armature, vertex weights, and Actions
+- Model with mesh (Armature, vertex weights, and Actions are optional for static models)
 
 ### For Standalone Script Method
 - **Blender 3.0+** (tested on 4.x)
 - **Python 3** (for `convert_flat.py` and `convert_shared_times.py` post-processing)
 - Model must have:
-  - Armature (skeleton)
-  - Vertex weights painted
-  - At least one Action (animation)
+  - Armature (skeleton) — optional for static models
+  - Vertex weights painted (if rigged)
+  - Actions (animations) — optional, static models work without
 
 ### For Rive
 - Rive Editor with Scripting enabled
