@@ -12,22 +12,6 @@ Import rigged 3D models with skeletal animations from Blender into Rive using Lu
 https://x.com/fredberria/status/2016568637310513207?s=20
 
 ---
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Quick Start](#quick-start)
-3. [Requirements](#requirements)
-4. [Tutorial: Step by Step](#tutorial-step-by-step)
-   - [Method 1: Using Blender MCP (Recommended)](#method-1-using-blender-mcp-recommended)
-   - [Method 2: Using Standalone Script](#method-2-using-standalone-script)
-5. [File Structure](#file-structure)
-6. [Data Format](#data-format)
-7. [Configuration Reference](#configuration-reference)
-8. [Property Group Reference](#property-group-reference)
-9. [Troubleshooting](#troubleshooting)
-10. [Advanced Topics](#advanced-topics)
-
----
 
 ## Overview
 
@@ -39,13 +23,13 @@ This pipeline allows you to:
 
 **Key Features:**
 - Automatic mesh normalization (~200 units)
-- Automatic fragmentation for large meshes (~2950 faces per part with flat arrays)
+- Automatic fragmentation for large meshes (~2950 faces per part)
 - Multiple animation support with runtime switching
 - Full skeletal animation with vertex skinning
 - Customizable material colors via Property Group
-- **Optimized flat array format** for vertices and faces (~60% file size reduction)
-- **Factorized skinning** (patterns + index, ~40% smaller)
-- **Blender MCP integration** for AI-assisted conversion
+- Optimized flat array format (~60% file size reduction)
+- Factorized skinning (patterns + index, ~40% smaller)
+- Blender MCP integration for AI-assisted conversion
 
 ---
 
@@ -133,11 +117,8 @@ Please extract the geometry, skeleton, and animations using Blender MCP.
 
 Claude Code will:
 1. Analyze your scene with `mcp__blender__get_scene_info`
-2. Extract geometry with `mcp__blender__execute_blender_code`
-3. Extract skeleton hierarchy and IBMs
-4. Extract skinning weights
-5. Extract all animation clips
-6. Generate ready-to-use `.luau` files with flat array format
+2. Extract geometry, skeleton, skinning weights, and animations
+3. Generate ready-to-use `.luau` files with flat array format
 
 #### Step 4: Copy to Rive
 
@@ -200,137 +181,12 @@ python3 convert_flat.py           # Vertices/faces -> flat arrays (~60% smaller)
 python3 convert_shared_times.py   # Factorize duplicate times in animations (~10% smaller)
 ```
 
-`convert_flat.py` converts vertices/faces from table-of-tables to flat stride-3/stride-4 format. `convert_shared_times.py` deduplicates identical `times` arrays shared across channels within each clip.
-
 #### Step 6: Copy to Rive
 
 Copy these files to your Rive project:
 - `YourModelPartAData.luau`, `YourModelPartBData.luau`, etc.
 - `Mesh3DUtil.luau`
 - `SkeletalAnimUtil.luau`
-
----
-
-## File Structure
-
-```
-project/
-├── blender_to_rive.py        # Standalone Blender export script
-├── convert_flat.py           # Convert Part data files to flat arrays (post-export)
-├── convert_shared_times.py   # Factorize duplicate times in animation files
-├── prompt.md                 # AI prompt for Blender MCP workflow
-├── Mesh3DUtil.luau           # 3D math (matrices, quaternions, projection)
-├── SkeletalAnimUtil.luau     # Skeleton building, animation, skinning
-├── Model.luau                # Main Node Script (rendering + Property Group)
-├── ModelPartAData.luau       # Generated data: vertices, faces, skeleton, skinning
-├── ModelPartBData.luau       # Generated data: vertices, faces, skinning
-├── ModelAnim1Data.luau       # Generated data: animation clips
-├── CLAUDE.md                 # Full technical documentation
-└── README.md                 # This file
-```
-
----
-
-## Data Format
-
-### Flat Arrays (Optimized)
-
-Vertices and faces use **flat number arrays** for ~60% smaller file sizes:
-
-```luau
--- Vertices: flat array, stride 3 (x, y, z per vertex)
-ModelData.vertices = {
-    10.825, -18.875, -1.141,
-    11.296, -19.324, 1.685,
-    -- ...
-}
--- Access vertex i: base = (i - 1) * 3
--- vx = vertices[base + 1], vy = vertices[base + 2], vz = vertices[base + 3]
-
--- Faces: flat array, stride 4 (v1, v2, v3, category per face)
-ModelData.faces = {
-    4150, 4151, 4152, 1,
-    4151, 4150, 4153, 1,
-    -- ...
-}
--- Access face fi (0-based): fBase = fi * 4
--- vi1 = faces[fBase + 1], category = faces[fBase + 4]
-```
-
-### Skeleton & Skinning
-
-```luau
-ModelData.skeleton = {
-    jointCount = 13,
-    jointParents = { nil, 1, 2, 2, 1, ... },
-    inverseBindMatrices = { { 16 floats }, ... },
-    restPose = {
-        { translation = {x,y,z}, rotation = {w,x,y,z}, scale = {1,1,1} },
-        ...
-    },
-}
-
--- Factorized skinning: patterns + per-vertex index
-ModelData.skinningPatterns = {
-    [0] = { j = {0,0,0,0}, w = {1.0,0,0,0} },
-    [1] = { j = {1,0,0,0}, w = {1.0,0,0,0} },
-    ...
-}
-ModelData.skinningIndex = { 1, 1, 1, 6, 6, 2, ... }  -- Per vertex
-```
-
-### Animations
-
-```luau
-ModelData.animations = {
-    ["Swim"] = {
-        name = "Swim",
-        duration = 4.21,
-        sharedTimes = {                    -- Factorized time arrays
-            {0, 0.033, 0.067, ...},        -- Pattern 1
-        },
-        channels = {
-            { jointIndex = 1, path = "rotation", timeRef = 1, values = {...} },
-            { jointIndex = 1, path = "translation", timeRef = 1, values = {...} },
-            ...
-        },
-    },
-}
-```
-
-- `sharedTimes`: unique time arrays shared across channels (generated by `convert_shared_times.py`)
-- `timeRef`: 1-based index into `sharedTimes` (replaces inline `times` arrays)
-
----
-
-## Configuration Reference
-
-### blender_to_rive.py Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `MODEL_NAME` | "Model" | Output file prefix |
-| `TARGET_SIZE` | 200.0 | Normalize mesh to this size |
-| `OUTPUT_DIR` | "//" | Output directory (// = relative to .blend) |
-| `MAX_FACES_PER_PART` | 2950 | Fragment threshold for faces (flat arrays) |
-
-### convert_flat.py
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `FILES` | (list) | Part data files to convert |
-| `BASE_DIR` | script dir | Directory containing .luau files |
-
-Edit the `FILES` list at the top of `convert_flat.py` to match your model's Part data files.
-
-### convert_shared_times.py
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `FILES` | (list) | Animation data files to process |
-| `BASE_DIR` | script dir | Directory containing .luau files |
-
-Edit the `FILES` list at the top of `convert_shared_times.py` to match your model's animation data files. The script is idempotent — safe to re-run.
 
 ---
 
@@ -374,56 +230,23 @@ Edit the `FILES` list at the top of `convert_shared_times.py` to match your mode
 
 ## Troubleshooting
 
-### Model Issues
+Common issues and quick fixes:
 
-| Problem | Cause | Solution |
-|---------|-------|----------|
-| Model twisted when animated | Coordinate space mismatch | Re-export with posed rest reference |
-| Model explodes during animation | Armature scale != 1 | Apply transforms in Blender (Ctrl+A) |
-| Body parts scattered | Different reference poses | Use posed rest for ALL exports |
-| Some faces missing | Wrong winding order | Check normals in Blender |
-| Z-fighting (flickering) | Faces at same depth | Use anti-flickering (depthBias + Z_EPSILON) |
+| Problem | Solution |
+|---------|----------|
+| Model explodes during animation | Apply transforms in Blender (Ctrl+A), re-export |
+| Animation doesn't play | Check console for available animation names |
+| Arms stuck in T-pose | Never reset `matrix_basis` before sampling |
+| Z-fighting (flickering) | Use anti-flickering: depthBias + Z_EPSILON sort |
+| "Code too complex to typecheck" | Reduce `MAX_FACES_PER_PART` |
+| Runtime error on `table.create()` | Use `{}` instead (Rive Luau, not Roblox) |
+| File too large | Run `convert_flat.py` for flat array format |
 
-### Animation Issues
-
-| Problem | Cause | Solution |
-|---------|-------|----------|
-| Animation doesn't play | Wrong animation name | Check console for available names |
-| Animation plays wrong | Multiple actions exported | Set correct `animationName` |
-| Arms in T-pose | `matrix_basis` reset | Never reset matrix_basis |
-| Body frozen in partial anim | Only some bones keyed | Use animation composition with Idle |
-| Animation too fast/slow | Wrong speed | Adjust `animationSpeed` Input |
-
-### Script Issues
-
-| Problem | Cause | Solution |
-|---------|-------|----------|
-| "Code too complex to typecheck" | Too many vertices per part | Reduce MAX_FACES_PER_PART |
-| "Path was modified between draws" | `path:reset()` in `draw()` | Build paths in `advance()` only |
-| Type errors | Untyped data access | Cast through `:: any` then to `:: { number }` |
-| Runtime error on `table.create()` | Roblox-only function | Use `{}` instead (standard Luau) |
-| `nil` crash on `self.field` | Field missing from constructor | Add field to `return function()` with initial value |
-
-### Export Issues
-
-| Problem | Cause | Solution |
-|---------|-------|----------|
-| No output files | Script error | Check Blender console for errors |
-| Missing animations | Actions not linked | Ensure actions are in Action Editor |
-| Wrong vertex count | Modifiers not applied | Apply modifiers before export |
-| File still large | Old table-of-tables format | Run `convert_flat.py` |
+For a comprehensive troubleshooting table and technical details, see [CLAUDE.md](CLAUDE.md).
 
 ---
 
 ## Advanced Topics
-
-### Using Blender MCP for Modifications
-
-With Blender MCP, you can also:
-- Modify materials and re-export
-- Adjust animations directly
-- Create new animation clips
-- Extract texture colors from screenshots
 
 ### Multiple Models
 
@@ -441,27 +264,7 @@ local blendFactor = 0.5  -- 0 = clipA, 1 = clipB
 SkelAnim.blendAnimations(skeleton, clipA, clipB, timeA, timeB, blendFactor)
 ```
 
-### Performance Optimization
-
-For better performance:
-- Reduce polygon count in Blender (decimate modifier)
-- Use flat arrays (`convert_flat.py`) for ~60% smaller data files
-- Factorize animation times (`convert_shared_times.py`) for ~10% smaller animation files
-- Use orthographic projection (`usePerspective = false`)
-- Keep `brightness` calculation simple
-
----
-
-## Critical Rules Summary
-
-1. **Single-Call Rule**: ALL static data (skeleton IBMs, normalization bounds, vertices) MUST come from the SAME `execute_blender_code` call. The evaluated mesh is non-deterministic across separate calls (depsgraph state pollution).
-2. **Coordinate Space Consistency**: ALL data (vertices, IBMs, rest pose, animations) must use the SAME normalized space ("posed rest" via `pose_bone.matrix` + evaluated mesh)
-3. **Scale = 1**: Always force scale to 1 on bone matrices
-4. **Quaternion Format**: Blender exports WXYZ, SkeletalAnimUtil converts to XYZW automatically
-5. **Animation Format**: Store FINAL local transforms (ABSOLUTE), not deltas. NEVER reset `matrix_basis`.
-6. **Atlas UV Sampling**: Use QUANT_STEP=0.005 (not 0.02) to preserve distinct color zones
-7. **Flat Arrays**: Vertices stride 3, faces stride 4 for ~60% file size reduction
-8. **Rive Restrictions**: Type annotations on `table.sort`, no `path:reset()` in `draw()`, NO `table.create()` (Roblox-only), constructor must mirror ALL type fields
+For full technical documentation (data format, export process, coordinate systems, anti-flickering, performance optimization, etc.), see [CLAUDE.md](CLAUDE.md).
 
 ---
 
